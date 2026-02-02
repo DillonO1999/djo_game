@@ -1,0 +1,6 @@
+[1/6] Building C object src/CMakeFiles/MyGame.dir/glad.c.o
+[2/6] Building CXX object src/CMakeFiles/MyGame.dir/Camera.cpp.o
+[3/6] Building CXX object src/CMakeFiles/MyGame.dir/Buildings.cpp.o
+[4/6] Building CXX object src/CMakeFiles/MyGame.dir/main.cpp.o
+[5/6] Building CXX object src/CMakeFiles/MyGame.dir/Game.cpp.o
+[6/6] Linking CXX executable src/MyGame

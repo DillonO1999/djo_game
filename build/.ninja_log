@@ -1,0 +1,7 @@
+# ninja log v5
+1	192	1770010039986023559	src/CMakeFiles/MyGame.dir/glad.c.o	120c6d6783e6f2b6
+1	470	1770010040323160787	src/CMakeFiles/MyGame.dir/Camera.cpp.o	e37cded064218014
+2	494	1770010040348160437	src/CMakeFiles/MyGame.dir/Buildings.cpp.o	a1958fc711411adf
+1	1060	1770010040914152497	src/CMakeFiles/MyGame.dir/main.cpp.o	13a5f9493dcf3c99
+1	1268	1770010041122900624	src/CMakeFiles/MyGame.dir/Game.cpp.o	b1489206e9581e23
+1268	1414	1770010041265147576	src/MyGame	d2e11047f4712b61
