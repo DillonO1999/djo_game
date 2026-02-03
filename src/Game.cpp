@@ -3,14 +3,18 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#define TINYOBJLOADER_IMPLEMENTATION // Define this in only *one* .cc file
+#include "tiny_obj_loader.h"
 
 // --- SHADER SOURCE CODE (GLSL) ---
 const char* vertexShaderSource = R"glsl(
     #version 330 core
     layout (location = 0) in vec3 aPos;
-    layout (location = 1) in vec2 aTexCoord; // New attribute
+    layout (location = 1) in vec2 aTexCoord;
+    layout (location = 2) in vec3 aNormal; // New
 
     out vec2 TexCoord;
+    out float slope; // Pass steepness to fragment shader
 
     uniform mat4 model;
     uniform mat4 view;
@@ -19,18 +23,26 @@ const char* vertexShaderSource = R"glsl(
     void main() {
         gl_Position = projection * view * model * vec4(aPos, 1.0);
         TexCoord = aTexCoord;
+        // Normal.y tells us how "upward" the surface faces (1.0 = flat, 0.0 = vertical)
+        slope = aNormal.y; 
     }
 )glsl";
 
 const char* fragmentShaderSource = R"glsl(
     #version 330 core
-    out vec4 FragColor;
+    out vec4 FragColor; // <--- ADD THIS LINE
+    
     in vec2 TexCoord;
+    in float slope;
 
-    uniform sampler2D texture1; // This represents our image
+    uniform sampler2D grassTexture;
+    uniform sampler2D rockTexture;
 
     void main() {
-        FragColor = texture(texture1, TexCoord);
+        vec4 grass = texture(grassTexture, TexCoord * 100.0);
+        vec4 rock = texture(rockTexture, TexCoord * 100.0);
+        float blend = smoothstep(0.6, 0.8, slope);
+        FragColor = mix(rock, grass, blend);
     }
 )glsl";
 
@@ -48,6 +60,8 @@ Game::Game() : pauseText(font), resumeText(font), exitText(font), sensitivityTex
         std::cerr << "Failed to initialize GLAD" << std::endl;
     }
 
+    camera.position = glm::vec3(490.0f, 40.0f, 490.0f); // 2 meters high, slightly back from center
+
     setupResources();
 
     windowCenter = sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2);
@@ -64,11 +78,113 @@ Game::Game() : pauseText(font), resumeText(font), exitText(font), sensitivityTex
     currentState = GameState::Playing; // Start the game in playing mode
 }
 
+float Game::getMapHeightAt(float x, float z) {
+    float highestY = -100.0f; // Default "void" height
+    bool foundFloor = false;
+
+    // Loop through triangles (3 vertices at a time, 5 floats per vertex)
+    for (size_t i = 0; i < mapVertices.size(); i += 24) {
+        glm::vec3 v0(mapVertices[i],     mapVertices[i+1], mapVertices[i+2]);
+        glm::vec3 v1(mapVertices[i+8],   mapVertices[i+9], mapVertices[i+10]);
+        glm::vec3 v2(mapVertices[i+16],  mapVertices[i+17], mapVertices[i+18]);
+        
+        // 1. Barycentric Coordinate check: Is (x, z) inside this triangle?
+        float det = (v1.z - v2.z) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.z - v2.z);
+        float l1 = ((v1.z - v2.z) * (x - v2.x) + (v2.x - v1.x) * (z - v2.z)) / det;
+        float l2 = ((v2.z - v0.z) * (x - v2.x) + (v0.x - v2.x) * (z - v2.z)) / det;
+        float l3 = 1.0f - l1 - l2;
+
+        if (l1 >= 0 && l2 >= 0 && l3 >= 0) {
+            // 2. If inside, calculate the Y height at this specific point
+            float h = l1 * v0.y + l2 * v1.y + l3 * v2.y;
+            highestY = std::max(highestY, h);
+            foundFloor = true;
+        }
+    }
+
+    return foundFloor ? highestY : 0.0f; 
+}
+
+void Game::loadMap(const std::string& path) {
+
+    if (mapVAO != 0) glDeleteVertexArrays(1, &mapVAO);
+    if (mapVBO != 0) glDeleteBuffers(1, &mapVBO);
+
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) {
+        std::cerr << "OBJ Loader Error: " << warn << err << std::endl;
+        return;
+    }
+
+    mapVertices.clear();
+
+    for (const auto& shape : shapes) {
+        for (const auto& index : shape.mesh.indices) {
+            // 1. Positions
+            float vx = attrib.vertices[3 * index.vertex_index + 0];
+            float vy = attrib.vertices[3 * index.vertex_index + 1];
+            float vz = attrib.vertices[3 * index.vertex_index + 2];
+            mapVertices.push_back(vx);
+            mapVertices.push_back(vy);
+            mapVertices.push_back(vz);
+
+            // 2. Textures (UVs) - Calculate tx and ty here!
+            float tx = 0.0f, ty = 0.0f;
+            if (index.texcoord_index >= 0) {
+                tx = attrib.texcoords[2 * index.texcoord_index + 0];
+                ty = attrib.texcoords[2 * index.texcoord_index + 1];
+            }
+            mapVertices.push_back(tx);
+            mapVertices.push_back(ty);
+
+            // 3. Normals
+            if (index.normal_index >= 0) {
+                mapVertices.push_back(attrib.normals[3 * index.normal_index + 0]);
+                mapVertices.push_back(attrib.normals[3 * index.normal_index + 1]);
+                mapVertices.push_back(attrib.normals[3 * index.normal_index + 2]);
+            } else {
+                mapVertices.push_back(0.0f); mapVertices.push_back(1.0f); mapVertices.push_back(0.0f);
+            }
+        }
+    }
+
+    // --- OpenGL Setup ---
+    glGenVertexArrays(1, &mapVAO);
+    glGenBuffers(1, &mapVBO);
+
+    glBindVertexArray(mapVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, mapVBO);
+    glBufferData(GL_ARRAY_BUFFER, mapVertices.size() * sizeof(float), mapVertices.data(), GL_STATIC_DRAW);
+
+    // Position (Location 0): 3 floats, starts at 0
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture (Location 1): 2 floats, starts after 3 Pos floats
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    // Normals (Location 2): 3 floats, starts after 3 Pos + 2 UV floats
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    
+    // Unbind to prevent accidental overrides
+    glBindVertexArray(0); 
+}
+
 void Game::setupResources() {
     unsigned int vs = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int fs = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
 
     shaderProgram = glCreateProgram();
+
+    glUseProgram(shaderProgram);
+    glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
+    glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
 
     // ATTACH FIRST
     glAttachShader(shaderProgram, vs);
@@ -89,92 +205,53 @@ void Game::setupResources() {
     glDeleteShader(vs);
     glDeleteShader(fs);
 
-   // 1. Define 8 corners of a cube (x, y, z)
-    float vertices[] = {
-        // Positions             // Texture (UV)
-        // FLOOR (Horizontal)
-        -100.0f, 0.0f, -100.0f,    0.0f,  0.0f,
-        100.0f, 0.0f, -100.0f,   200.0f,  0.0f,
-        100.0f, 0.0f,  100.0f,   200.0f, 200.0f,
-        -100.0f, 0.0f,  100.0f,    0.0f, 200.0f,
+    loadMap("assets/maps/Towers/Towers.obj");
 
-        // WALL TYPE A (Front/Back - XY Plane)
-        -10.0f, 0.0f, 0.0f,      0.0f,  0.0f,
-        10.0f, 0.0f, 0.0f,     20.0f,  0.0f,
-        10.0f, 4.0f, 0.0f,     20.0f,  4.0f,
-        -10.0f, 4.0f, 0.0f,      0.0f,  4.0f,
-
-        // WALL TYPE B (Left/Right - ZY Plane)
-        0.0f, 0.0f, -10.0f,     0.0f,  0.0f,
-        0.0f, 0.0f,  10.0f,    20.0f,  0.0f,
-        0.0f, 4.0f,  10.0f,    20.0f,  4.0f,
-        0.0f, 4.0f, -10.0f,     0.0f,  4.0f
-    };
-
-    unsigned int indices[] = {
-        0, 3, 2, 2, 1, 0,       // Floor (Reversed order to face UP)
-        4, 5, 6, 6, 7, 4,       // Wall Front/Back
-        8, 9, 10, 10, 11, 8     // Wall Left/Right
-    };
-
-    unsigned int EBO; // Element Buffer Object
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
-    glGenBuffers(1, &EBO);
-
-    glBindVertexArray(VAO);
-
-    // Upload Vertex Data
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-    // Upload Index Data
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Texture attribute (Location 1)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_2D, textureID);
-
-    // Set wrapping/filtering options
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-
-    // 1. Load the image using SFML
-    sf::Image image;
-    if (!image.loadFromFile("assets/textures/images.jpeg")) {
-        std::cout << "Failed to load texture at assets/textures/images.jpeg" << std::endl;
-    } else {
-        // 2. OpenGL expects the texture upside down, SFML can fix this easily
-        image.flipVertically(); 
-
-        // 3. Get the raw pixel data and dimensions
-        const uint8_t* pixelData = image.getPixelsPtr();
-        sf::Vector2u size = image.getSize();
-
-        // 4. Upload to the GPU (Note: SFML pixels are usually RGBA)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size.x, size.y, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixelData);
+    // Load Grass Texture
+    glGenTextures(1, &grassTextureID);
+    glBindTexture(GL_TEXTURE_2D, grassTextureID);
+    // ... Set parameters (Wrap/Filter) ...
+    sf::Image grassImg;
+    if (grassImg.loadFromFile("assets/textures/grass.jpg")) { // Make sure this path exists!
+        grassImg.flipVertically();
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, grassImg.getSize().x, grassImg.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, grassImg.getPixelsPtr());
         glGenerateMipmap(GL_TEXTURE_2D);
     }
-    glUseProgram(shaderProgram);
-    glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 0);
+
+    // Load Rock Texture
+    glGenTextures(1, &rockTextureID);
+    glBindTexture(GL_TEXTURE_2D, rockTextureID);
+    // ... Set parameters (Wrap/Filter) ...
+    sf::Image rockImg;
+    if (rockImg.loadFromFile("assets/textures/black-stone.jpg")) { // Make sure this path exists!
+        rockImg.flipVertically();
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rockImg.getSize().x, rockImg.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, rockImg.getPixelsPtr());
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
 }
 
 unsigned int Game::compileShader(unsigned int type, const char* source) {
     unsigned int id = glCreateShader(type);
     glShaderSource(id, 1, &source, nullptr);
     glCompileShader(id);
+
+    // Check for compilation errors
+    int success;
+    char infoLog[512];
+    glGetShaderiv(id, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        glGetShaderInfoLog(id, 512, NULL, infoLog);
+        std::cerr << "ERROR: Shader Compilation Failed (" 
+                  << (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT") 
+                  << ")\n" << infoLog << std::endl;
+    }
     return id;
 }
 
 void Game::run() {
     sf::Clock clock;
+
+    glDisable(GL_CULL_FACE);
     
     // Enable Depth Testing so objects behind others are hidden correctly
     glEnable(GL_DEPTH_TEST); 
@@ -193,39 +270,35 @@ void Game::run() {
         glDepthMask(GL_TRUE); 
         glDepthFunc(GL_LESS);
 
-        // 2. Use the shader and set Camera/Perspective
         glUseProgram(shaderProgram);
-        // --- ADD THESE TWO LINES ---
-        glActiveTexture(GL_TEXTURE0); // Activate texture unit 0
-        glBindTexture(GL_TEXTURE_2D, textureID); // Bind your texture to it
-        glm::mat4 view = camera.getViewMatrix();
-        float aspect = window.getSize().x / (float)window.getSize().y;
-        glm::mat4 projection = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
 
+        // Re-enable these!
         unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
         unsigned int viewLoc  = glGetUniformLocation(shaderProgram, "view");
         unsigned int projLoc  = glGetUniformLocation(shaderProgram, "projection");
 
+        glm::mat4 view = camera.getViewMatrix();
+        float aspect = window.getSize().x / (float)window.getSize().y;
+        glm::mat4 projection = glm::perspective(glm::radians(45.0f), aspect, 1.0f, 10000.0f);
+
         glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(projection));
 
-        glBindVertexArray(VAO);
-
-        // 1. Draw the Floor
+        glBindVertexArray(mapVAO);
         glm::mat4 model = glm::mat4(1.0f); 
-        // Move it down to -1.0 so you are standing ON it
-        model = glm::translate(model, glm::vec3(0.0f, 0.0f, 0.0f)); 
         glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, (void*)0);
 
-        // --- BUILDING SETUP ---
-        // We want a 10x10 building at X=20, Z=20
-        float bX = 20.0f;
-        float bZ = 20.0f;
-        float bWidth = 10.0f;
-        float bHeight = 10.0f;
-        building.drawBuilding(bX, bZ, bWidth, bHeight, modelLoc);   
-        building.drawBuilding(-20.0f, 20.0f, bWidth, bHeight, modelLoc);        
+        glBindVertexArray(mapVAO); // This handles all your pointers automatically
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, grassTextureID);
+        glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, rockTextureID);
+        glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
+
+        glDrawArrays(GL_TRIANGLES, 0, mapVertices.size() / 8); // Divide by 8 now!
 
         window.resetGLStates();
 
@@ -292,8 +365,9 @@ void Game::processEvents(float deltaTime) {
     
     if (currentState == GameState::Playing) {
         // --- 1. SET DYNAMIC SPEED ---
-        // If crouching, go slow. If standing, go normal.
-        camera.speed = camera.isCrouching ? 2.5f : 5.0f;
+        // Change these values to match your new scale
+        float baseSpeed = 7.0f; // Was likely 5.0f
+        camera.speed = camera.isCrouching ? (baseSpeed * 0.5f) : baseSpeed;
 
         glm::vec3 prevPos = camera.position;
         
@@ -306,89 +380,25 @@ void Game::processEvents(float deltaTime) {
         // 1. Define constants
         const float standHeight = 1.5f;
         const float crouchHeight = 0.8f;
-        const float floorLevel = 0.0f;
         const float interSpeed = 8.0f; 
 
-        // 2. Determine target height based on the TOGGLE state
+        // 1. Get the height of the Blender mesh at player's X, Z
+        // 1. Get the floor height from your OBJ
+        float currentMapHeight = getMapHeightAt(camera.position.x, camera.position.z);
         float targetHeight = camera.isCrouching ? crouchHeight : standHeight;
-        float targetY = floorLevel + targetHeight;
+        float targetY = currentMapHeight + targetHeight;
 
-        // 4. THE SMOOTH HEIGHT SLIDE
-        if (camera.isGrounded) {
-            // This is the ONLY place position.y is modified while on the floor
-            float dy = (targetY - camera.position.y) * interSpeed * deltaTime;
-            camera.position.y += dy;
-            camera.verticalVelocity = 0.0f; // Kill gravity buildup
-        }
+        // 2. Smoothly move toward the target height (Up OR Down)
+        // This "Lerp" handles both climbing hills and walking down them.
+        float dy = (targetY - camera.position.y) * interSpeed * deltaTime;
+        camera.position.y += dy;
 
-        // 4. GRAVITY (Only applies if we fall off a ledge)
-        if (!camera.isGrounded) {
-            camera.verticalVelocity += camera.gravity * deltaTime;
-            camera.position.y += camera.verticalVelocity * deltaTime;
-        }
-
-        // 6. DYNAMIC FLOOR CHECK
-        // This makes the "Floor" move with your crouch state
-        if (camera.position.y <= targetY) {
-            if (!camera.isGrounded) {
-                camera.position.y = targetY; // Snap ONLY when landing a fall
-            }
+        // 3. Grounding check (for jumping logic)
+        if (std::abs(camera.position.y - targetY) < 0.1f) {
             camera.isGrounded = true;
             camera.verticalVelocity = 0.0f;
         } else {
-            // If we are significantly above our current target, we are in the air
-            if (std::abs(camera.position.y - targetY) > 0.01f) {
-                camera.isGrounded = false;
-            }
-        }
-
-        // Define all building positions
-        glm::vec2 buildings[] = { {20.0f, 20.0f}, {-20.0f, 20.0f} };
-        float pRadius = 0.4f; // Player's collision radius
-
-        for (auto& bPos : buildings) {
-            float bX = bPos.x;
-            float bZ = bPos.y;
-            float half = 5.0f;
-
-            // Boundary Lines
-            float left   = bX - half;
-            float right  = bX + half;
-            float back   = bZ - half;
-            float front  = bZ + half;
-
-            // 1. WEST & EAST WALLS (The Side Walls)
-            // Check if we are within the Z-length of the walls
-            if (camera.position.z > back - pRadius && camera.position.z < front + pRadius) {
-                
-                // West Wall (Left) - Zone is [left - radius, left + radius]
-                if (camera.position.x > left - pRadius && camera.position.x < left + pRadius) {
-                    camera.position.x = (prevPos.x <= left - pRadius) ? left - pRadius : left + pRadius;
-                }
-
-                // East Wall (Right)
-                if (camera.position.x > right - pRadius && camera.position.x < right + pRadius) {
-                    camera.position.x = (prevPos.x >= right + pRadius) ? right + pRadius : right - pRadius;
-                }
-            }
-
-            // 2. NORTH & SOUTH WALLS (Back & Front)
-            // Check if we are within the X-width of the walls
-            if (camera.position.x > left - pRadius && camera.position.x < right + pRadius) {
-                
-                // North Wall (Back)
-                if (camera.position.z > back - pRadius && camera.position.z < back + pRadius) {
-                    camera.position.z = (prevPos.z <= back - pRadius) ? back - pRadius : back + pRadius;
-                }
-
-                // South Wall (Front - The Door Wall)
-                bool inDoorX = (camera.position.x > bX - 1.2f && camera.position.x < bX + 1.2f);
-                if (!inDoorX) {
-                    if (camera.position.z > front - pRadius && camera.position.z < front + pRadius) {
-                        camera.position.z = (prevPos.z >= front + pRadius) ? front + pRadius : front - pRadius;
-                    }
-                }
-            }
+            camera.isGrounded = false;
         }
 
         // 3. Handle Jump Input

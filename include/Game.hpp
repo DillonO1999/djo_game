@@ -56,7 +56,16 @@ class Game {
 
         Buildings building;
 
+        std::vector<float> mapVertices;
+        unsigned int mapVAO, mapVBO;
+
+        unsigned int grassTextureID;
+        unsigned int rockTextureID;
+        // Keep your old textureID if you still need it, or replace it.
+
         void setupUI();
+        void loadMap(const std::string& path);
+        float getMapHeightAt(float x, float z);
 };
 
 #endif
