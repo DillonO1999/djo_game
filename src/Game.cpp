@@ -46,6 +46,19 @@ const char* fragmentShaderSource = R"glsl(
     }
 )glsl";
 
+const char* objectFragmentShaderSource = R"glsl(
+    #version 330 core
+    out vec4 FragColor;
+    in vec2 TexCoord;
+    uniform sampler2D objectTexture;
+
+    void main() {
+        vec4 texColor = texture(objectTexture, TexCoord);
+        if(texColor.a < 0.1) discard; // Support for transparent fences/leaves
+        FragColor = texColor;
+    }
+)glsl";
+
 Game::Game() : pauseText(font), resumeText(font), exitText(font), sensitivityText(font) {
     sf::ContextSettings settings;
     settings.depthBits = 24;
@@ -177,33 +190,36 @@ void Game::loadMap(const std::string& path) {
 }
 
 void Game::setupResources() {
+    // Compile shaders
     unsigned int vs = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
     unsigned int fs = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
+    unsigned int ofs = compileShader(GL_FRAGMENT_SHADER, objectFragmentShaderSource);
 
+    // --- TERRAIN SHADER ---
     shaderProgram = glCreateProgram();
-
+    glAttachShader(shaderProgram, vs);
+    glAttachShader(shaderProgram, fs);
+    glLinkProgram(shaderProgram);
+    
+    // Set terrain texture units (Do this once!)
     glUseProgram(shaderProgram);
     glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
     glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
 
-    // ATTACH FIRST
-    glAttachShader(shaderProgram, vs);
-    glAttachShader(shaderProgram, fs);
+    // --- OBJECT SHADER ---
+    objectShaderProgram = glCreateProgram();
+    glAttachShader(objectShaderProgram, vs); // Reuse the same vertex logic
+    glAttachShader(objectShaderProgram, ofs);
+    glLinkProgram(objectShaderProgram);
 
-    // LINK ONCE AFTER ATTACHING
-    glLinkProgram(shaderProgram);
+    // Set object texture unit (Do this once!)
+    glUseProgram(objectShaderProgram);
+    glUniform1i(glGetUniformLocation(objectShaderProgram, "objectTexture"), 0);
 
-    // Check for linking errors (very helpful for debugging segfaults)
-    int success;
-    char infoLog[512];
-    glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
-    if (!success) {
-        glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
-        std::cerr << "Shader Linking Error: " << infoLog << std::endl;
-    }
-
+    // Cleanup
     glDeleteShader(vs);
     glDeleteShader(fs);
+    glDeleteShader(ofs);
 
     loadMap("assets/maps/Towers/Towers.obj");
 
@@ -228,6 +244,104 @@ void Game::setupResources() {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rockImg.getSize().x, rockImg.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, rockImg.getPixelsPtr());
         glGenerateMipmap(GL_TEXTURE_2D);
     }
+
+    // 3. LOAD TEMPLATES ONCE (The "Heavy" part)
+    GameObject fenceTemplate;
+    loadObject(fenceTemplate, "assets/objects/Farm Buildings - Sept 2018/OBJ/Fence.obj", "assets/textures/wood.png");
+
+    GameObject treeTemplate;
+    loadObject(treeTemplate, "assets/objects/Ultimate Nature Pack - Jun 2019/OBJ/CommonTree_5.obj", "assets/textures/leaves.png");
+
+    // 4. THE FENCE LOOP (The "Fast" part)
+    for (int i = 0; i < 4000; i += 6) {
+        GameObject f = fenceTemplate; // Copying the VAO/VBO IDs, not reloading files
+
+        // Use corrected C++ logic: (i >= min && i < max)
+        if (i >= 0 && i < 1000) {
+            f.position = glm::vec3(498.0f - static_cast<float>(i), 0.0f, 498.0f);
+            f.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+        } else if (i >= 1000 && i < 2000) {
+            f.position = glm::vec3(-498.0f, 0.0f, 498.0f - static_cast<float>(i - 1000));
+            f.rotation = glm::vec3(0.0f, 90.0f, 0.0f); // Rotate Y to turn the corner
+        } else if (i >= 2000 && i < 3000) {
+            f.position = glm::vec3(-498.0f + static_cast<float>(i - 2000), 0.0f, -498.0f);
+            f.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+        } else if (i >= 3000 && i < 4000) {
+            f.position = glm::vec3(498.0f, 0.0f, -498.0f + static_cast<float>(i - 3000));
+            f.rotation = glm::vec3(0.0f, 90.0f, 0.0f);
+        }
+
+        // 2. FETCH the data from the map (Height and Normal)
+        f.position.y = getMapHeightAt(f.position.x, f.position.z);
+        glm::vec3 groundNormal = getMapNormalAt(f.position.x, f.position.z); // Create it here!
+        f.groundNormal = groundNormal; // Store it for later
+
+        // 3. DO the math using that groundNormal
+        glm::vec3 worldUp(0, 1, 0);
+        float dot = glm::clamp(glm::dot(worldUp, groundNormal), -1.0f, 1.0f);
+        float angle = acos(dot);
+        glm::vec3 axis = glm::cross(worldUp, groundNormal);
+
+        glm::mat4 slopeRotation = glm::mat4(1.0f);
+        if (glm::length(axis) > 0.001f) {
+            slopeRotation = glm::rotate(glm::mat4(1.0f), angle, glm::normalize(axis));
+        }
+
+        // 4. BUILD the final matrix
+        f.modelMatrix = glm::translate(glm::mat4(1.0f), f.position) * slopeRotation * glm::rotate(glm::mat4(1.0f), glm::radians(f.rotation.y), worldUp) * glm::scale(glm::mat4(1.0f), f.scale);
+
+        // 5. FINALLY push to the list
+        sceneObjects.push_back(f);
+    }
+
+    // 5. THE TREE LOOP
+    for (int i = 0; i < 50; i++) {
+        GameObject t = treeTemplate;
+        float rx = -100.0f + static_cast<float>(-(rand() % 375));
+        float rz = 100.0f + static_cast<float>(rand() % 375);
+
+        // 1. Get Height and Normal
+        float groundY = getMapHeightAt(rx, rz);
+        glm::vec3 groundNormal = getMapNormalAt(rx, rz);
+        
+        t.position = glm::vec3(rx, groundY, rz);
+        
+        // 2. Random Scale & Rotation
+        float s = 10.0f + static_cast<float>(rand() % 201) / 10.0f;
+        t.scale = glm::vec3(s, s, s);
+        float randomYaw = static_cast<float>(rand() % 360);
+
+        // 3. Calculate Slope Matrix (Just like the fences!)
+        glm::vec3 worldUp(0, 1, 0);
+        float dot = glm::clamp(glm::dot(worldUp, groundNormal), -1.0f, 1.0f);
+        float angle = acos(dot);
+        glm::vec3 axis = glm::cross(worldUp, groundNormal);
+
+        glm::mat4 slopeRotation = glm::mat4(1.0f);
+        if (glm::length(axis) > 0.001f) {
+            slopeRotation = glm::rotate(glm::mat4(1.0f), angle, glm::normalize(axis));
+        }
+
+        // 4. Final Matrix Construction
+        t.modelMatrix = glm::translate(glm::mat4(1.0f), t.position) * slopeRotation * glm::rotate(glm::mat4(1.0f), glm::radians(randomYaw), worldUp) * glm::scale(glm::mat4(1.0f), t.scale);
+        t.isTree = true; 
+        
+        sceneObjects.push_back(t);
+    }
+
+    GameObject TowerWindmill;
+    loadObject(TowerWindmill, "assets/objects/Farm Buildings - Sept 2018/OBJ/TowerWindmill.obj", "assets/textures/wood.png");
+    TowerWindmill.position = glm::vec3(400.0f, getMapHeightAt(400.0f, -400.0f), -400.0f);
+    TowerWindmill.scale = glm::vec3(15.0f,15.0f,15.0f);
+    TowerWindmill.rotation = glm::vec3(0.0f, -45.0f, 0.0f);
+    sceneObjects.push_back(TowerWindmill);
+
+    GameObject Barn;
+    loadObject(Barn, "assets/objects/Farm Buildings - Sept 2018/OBJ/OpenBarn.obj", "assets/textures/wood.png");
+    Barn.position = glm::vec3(-400.0f, getMapHeightAt(-400.0f, -400.0f), -400.0f);
+    Barn.scale = glm::vec3(15.0f,15.0f,15.0f);
+    Barn.rotation = glm::vec3(0.0f, 45.0f, 0.0f);
+    sceneObjects.push_back(Barn);
 }
 
 unsigned int Game::compileShader(unsigned int type, const char* source) {
@@ -256,6 +370,9 @@ void Game::run() {
     // Enable Depth Testing so objects behind others are hidden correctly
     glEnable(GL_DEPTH_TEST); 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     while (window.isOpen()) {
         float deltaTime = clock.restart().asSeconds();
@@ -288,8 +405,6 @@ void Game::run() {
         glm::mat4 model = glm::mat4(1.0f); 
         glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
 
-        glBindVertexArray(mapVAO); // This handles all your pointers automatically
-
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, grassTextureID);
         glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
@@ -299,6 +414,18 @@ void Game::run() {
         glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
 
         glDrawArrays(GL_TRIANGLES, 0, mapVertices.size() / 8); // Divide by 8 now!
+
+        // 2. Draw all other objects
+        for (auto& obj : sceneObjects) {
+            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(obj.getModelMatrix()));
+            glBindVertexArray(obj.VAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, obj.textureID);
+            
+            // Note: We use a different uniform for object texture since map uses two textures
+            // You might want a simpler "StaticObjectShader" for single-texture objects
+            glDrawArrays(GL_TRIANGLES, 0, obj.vertexCount);
+        }
 
         window.resetGLStates();
 
@@ -359,52 +486,120 @@ void Game::processEvents(float deltaTime) {
             if (keyPressed->code == sf::Keyboard::Key::C && currentState == GameState::Playing) {
                 camera.isCrouching = !camera.isCrouching; // Flip the state
             }
+
+            // --- SPRINT TOGGLE ---
+            if (keyPressed->code == sf::Keyboard::Key::LShift && currentState == GameState::Playing) {
+                camera.isSprinting = !camera.isSprinting; // Flip the state
+            }
+            
+            // TODO: make this a button in pause menu
+            if (keyPressed->code == sf::Keyboard::Key::G && currentState == GameState::Playing) {
+                isCreativeMode = !isCreativeMode;
+                // Reset velocity when entering/exiting to prevent "sliding"
+                camera.verticalVelocity = 0.0f; 
+            }
         }
     }
 
     
     if (currentState == GameState::Playing) {
         // --- 1. SET DYNAMIC SPEED ---
-        // Change these values to match your new scale
-        float baseSpeed = 7.0f; // Was likely 5.0f
-        camera.speed = camera.isCrouching ? (baseSpeed * 0.5f) : baseSpeed;
+        float baseSpeed = isCreativeMode ? 90.0f : 7.0f;
+        float targetMult = 1.0f;
+        if (camera.isSprinting) targetMult = 1.7f;
+        if (camera.isCrouching) targetMult = 0.4f;
 
-        glm::vec3 prevPos = camera.position;
-        
-        // Keyboard Movement (Outside the event loop for smooth motion)
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::W) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Up)) camera.processKeyboard('W', deltaTime);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Down)) camera.processKeyboard('S', deltaTime);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::A) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Left)) camera.processKeyboard('A', deltaTime);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::D) || sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Right)) camera.processKeyboard('D', deltaTime);
+        camera.speedMultiplier = glm::mix(camera.speedMultiplier, targetMult, 3.0f * deltaTime);
+        camera.speed = baseSpeed * camera.speedMultiplier;
 
-        // 1. Define constants
-        const float standHeight = 1.5f;
-        const float crouchHeight = 0.8f;
-        const float interSpeed = 8.0f; 
-
-        // 1. Get the height of the Blender mesh at player's X, Z
-        // 1. Get the floor height from your OBJ
-        float currentMapHeight = getMapHeightAt(camera.position.x, camera.position.z);
-        float targetHeight = camera.isCrouching ? crouchHeight : standHeight;
-        float targetY = currentMapHeight + targetHeight;
-
-        // 2. Smoothly move toward the target height (Up OR Down)
-        // This "Lerp" handles both climbing hills and walking down them.
-        float dy = (targetY - camera.position.y) * interSpeed * deltaTime;
-        camera.position.y += dy;
-
-        // 3. Grounding check (for jumping logic)
-        if (std::abs(camera.position.y - targetY) < 0.1f) {
-            camera.isGrounded = true;
-            camera.verticalVelocity = 0.0f;
-        } else {
+        // 2. JUMP INPUT (Move this UP!)
+        if (!isCreativeMode && sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space) && camera.isGrounded) {
+            camera.verticalVelocity = 7.0f;
             camera.isGrounded = false;
         }
 
-        // 3. Handle Jump Input
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space) && camera.isGrounded) {
-            camera.verticalVelocity = 5.0f; // Jump force
-            camera.isGrounded = false;
+        // --- 2. PRE-MOVEMENT CHECK ---
+        glm::vec3 oldPos = camera.position;
+        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::W)) camera.processKeyboard('W', deltaTime, isCreativeMode);
+        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S)) camera.processKeyboard('S', deltaTime, isCreativeMode);
+        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::A)) camera.processKeyboard('A', deltaTime, isCreativeMode);
+        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::D)) camera.processKeyboard('D', deltaTime, isCreativeMode);
+
+        if (!isCreativeMode) {
+            glm::vec3 nextNormal = getMapNormalAt(camera.position.x, camera.position.z);
+            const float slopeLimit = 0.6f;
+            if (nextNormal.y < slopeLimit && camera.isGrounded) {
+                camera.position.x = oldPos.x;
+                camera.position.z = oldPos.z;
+            }
+        }
+
+        // 4. PHYSICS PREP
+        float terrainHeight = getMapHeightAt(camera.position.x, camera.position.z);
+        glm::vec3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
+        
+        // SMOOTH CROUCH FIX: Interpolate the OFFSET, not the total Y
+        float targetEyeHeight = camera.isCrouching ? 0.8f : 1.5f;
+        camera.currentEyeHeight = glm::mix(camera.currentEyeHeight, targetEyeHeight, 8.0f * deltaTime);
+        
+        float floorY = terrainHeight + camera.currentEyeHeight;
+
+        // 5. VERTICAL PHYSICS (Apply gravity BEFORE checking collision)
+        if (isCreativeMode) {
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space)) camera.position.y += camera.speed * deltaTime;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl)) camera.position.y -= camera.speed * deltaTime;
+            if (camera.position.y < floorY) camera.position.y = floorY;
+            camera.verticalVelocity = 0.0f;
+        } else {
+            // Apply Gravity first
+            if (!camera.isGrounded) {
+                camera.verticalVelocity -= 15.0f * deltaTime;
+            }
+            camera.position.y += camera.verticalVelocity * deltaTime;
+
+            // --- 6. GROUND COLLISION & ILLEGAL SLOPE CHECK ---
+            const float slopeLimit = 0.6f;
+            float snapDistance = 0.5f;
+
+            // Check if we are hitting the floor
+            bool hittingFloor = (camera.position.y <= floorY);
+            // Check if we are close enough to snap (downhill running)
+            bool shouldSnap = (camera.isGrounded && camera.position.y <= floorY + snapDistance && camera.verticalVelocity <= 0.1f);
+
+            if (hittingFloor || shouldSnap) {
+                // We are touching the terrain... but is it a walkable slope?
+                if (groundNormal.y >= slopeLimit) {
+                    // VALID GROUND: Snap to floor and stop falling
+                    camera.position.y = floorY;
+                    camera.verticalVelocity = 0.0f;
+                    camera.isGrounded = true;
+                } 
+                else {
+                    // ILLEGAL SLOPE: Force sliding state
+                    camera.isGrounded = false; // This is the key! Never stay grounded here.
+                    
+                    // Calculate downhill direction
+                    glm::vec3 worldDown(0.0f, -1.0f, 0.0f);
+                    glm::vec3 slideDir = worldDown - (groundNormal * glm::dot(worldDown, groundNormal));
+                    
+                    if (glm::length(slideDir) > 0.001f) {
+                        slideDir = glm::normalize(slideDir);
+                        float slideSpeed = 15.0f; // Fast enough to overpower walking
+                        camera.position.x += slideDir.x * slideSpeed * deltaTime;
+                        camera.position.z += slideDir.z * slideSpeed * deltaTime;
+                    }
+
+                    // IMPORTANT: If we hit a steep slope, we stay slightly above it
+                    // so that the gravity code below continues to pull us down.
+                    if (camera.position.y < floorY + 0.05f) {
+                        camera.position.y = floorY + 0.05f;
+                    }
+                }
+            } 
+            else {
+                // TRULY IN THE AIR
+                camera.isGrounded = false;
+            }
         }
 
         // Mouse Look - CALCULATE EVERY FRAME
@@ -415,6 +610,39 @@ void Game::processEvents(float deltaTime) {
 
             camera.processMouse(xoffset, yoffset);
             sf::Mouse::setPosition(windowCenter, window); // Reset to center
+        }
+
+        // --- PERIMETER COLLISION ---
+        const float boundary = 497.0f; // Slightly inside the 498 fence line
+
+        // Check X boundary
+        if (camera.position.x > boundary)  camera.position.x = boundary;
+        if (camera.position.x < -boundary) camera.position.x = -boundary;
+
+        // Check Z boundary
+        if (camera.position.z > boundary)  camera.position.z = boundary;
+        if (camera.position.z < -boundary) camera.position.z = -boundary;
+
+        // After movement keys, check against every tree
+        for (auto& obj : sceneObjects) {
+            // We only care about objects that should have collision (like trees)
+            // You can add a 'bool hasCollision' to your GameObject struct
+            if (obj.isTree) { 
+                float dx = camera.position.x - obj.position.x;
+                float dz = camera.position.z - obj.position.z;
+                float distanceSquared = dx*dx + dz*dz;
+                float radius = 2.0f * obj.scale[0] / 10.0f; // The thickness of the tree trunk
+
+                if (distanceSquared < radius * radius) {
+                    // Collision detected! Push the player back
+                    float distance = sqrt(distanceSquared);
+                    float overlap = radius - distance;
+                    
+                    // Move camera away from tree center
+                    camera.position.x += (dx / distance) * overlap;
+                    camera.position.z += (dz / distance) * overlap;
+                }
+            }
         }
     }
 
@@ -472,6 +700,87 @@ void Game::processEvents(float deltaTime) {
         } else {
             draggingSlider = false;
         }
+    }
+}
+
+glm::vec3 Game::getMapNormalAt(float x, float z) {
+    // 8 floats per vertex: Pos(3), Tex(2), Norm(3)
+    // 3 vertices per triangle = 24 floats
+    for (size_t i = 0; i < mapVertices.size(); i += 24) {
+        glm::vec3 v0(mapVertices[i],     mapVertices[i+1], mapVertices[i+2]);
+        glm::vec3 v1(mapVertices[i+8],   mapVertices[i+9], mapVertices[i+10]);
+        glm::vec3 v2(mapVertices[i+16],  mapVertices[i+17], mapVertices[i+18]);
+
+        float det = (v1.z - v2.z) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.z - v2.z);
+        float l1 = ((v1.z - v2.z) * (x - v2.x) + (v2.x - v1.x) * (z - v2.z)) / det;
+        float l2 = ((v2.z - v0.z) * (x - v2.x) + (v0.x - v2.x) * (z - v2.z)) / det;
+        float l3 = 1.0f - l1 - l2;
+
+        if (l1 >= 0 && l2 >= 0 && l3 >= 0) {
+            // Normals start at index + 5
+            glm::vec3 n0(mapVertices[i+5],  mapVertices[i+6],  mapVertices[i+7]);
+            glm::vec3 n1(mapVertices[i+13], mapVertices[i+14], mapVertices[i+15]);
+            glm::vec3 n2(mapVertices[i+21], mapVertices[i+22], mapVertices[i+23]);
+
+            // Blend the normals based on where you are in the triangle
+            return glm::normalize(l1 * n0 + l2 * n1 + l3 * n2);
+        }
+    }
+    return glm::vec3(0.0f, 1.0f, 0.0f); // Default to flat ground if not found
+}
+
+void Game::loadObject(GameObject& obj, const std::string& path, const std::string& texPath) {
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) return;
+
+    std::vector<float> vertices;
+    for (const auto& shape : shapes) {
+        for (const auto& index : shape.mesh.indices) {
+            // Position
+            vertices.push_back(attrib.vertices[3 * index.vertex_index + 0]);
+            vertices.push_back(attrib.vertices[3 * index.vertex_index + 1]);
+            vertices.push_back(attrib.vertices[3 * index.vertex_index + 2]);
+            // UVs
+            if (index.texcoord_index >= 0) {
+                vertices.push_back(attrib.texcoords[2 * index.texcoord_index + 0]);
+                vertices.push_back(attrib.texcoords[2 * index.texcoord_index + 1]);
+            } else { vertices.push_back(0.0f); vertices.push_back(0.0f); }
+            // Normals
+            if (index.normal_index >= 0) {
+                vertices.push_back(attrib.normals[3 * index.normal_index + 0]);
+                vertices.push_back(attrib.normals[3 * index.normal_index + 1]);
+                vertices.push_back(attrib.normals[3 * index.normal_index + 2]);
+            } else { vertices.push_back(0.0f); vertices.push_back(1.0f); vertices.push_back(0.0f); }
+        }
+    }
+
+    obj.vertexCount = vertices.size() / 8;
+    glGenVertexArrays(1, &obj.VAO);
+    glGenBuffers(1, &obj.VBO);
+    glBindVertexArray(obj.VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, obj.VBO);
+    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+
+    // Set attributes (Pos:0, Tex:1, Norm:2) - Same 8-float stride as map
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(5 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    // Load Texture
+    glGenTextures(1, &obj.textureID);
+    glBindTexture(GL_TEXTURE_2D, obj.textureID);
+    sf::Image img;
+    if (img.loadFromFile(texPath)) {
+        img.flipVertically();
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.getSize().x, img.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.getPixelsPtr());
+        glGenerateMipmap(GL_TEXTURE_2D);
     }
 }
 

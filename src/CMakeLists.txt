@@ -4,7 +4,6 @@ add_executable(MyGame
     main.cpp
     glad.c
     Camera.cpp
-    Buildings.cpp
 )
 
 target_include_directories(MyGame PRIVATE src ../include)

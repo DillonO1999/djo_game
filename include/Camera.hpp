@@ -13,6 +13,7 @@ class Camera {
         float pitch =  0.0f;  // Up/Down rotation
         float speed =  5.5f;
 
+        float currentEyeHeight = 1.5f; // Start at standing height
 
         float verticalVelocity = 0.0f;
         bool isGrounded = true;
@@ -20,11 +21,13 @@ class Camera {
 
         glm::mat4 getViewMatrix();
 
-        void processKeyboard(char direction, float deltaTime);
+        void processKeyboard(char direction, float deltaTime, bool isCreative);
 
         void processMouse(float xoffset, float yoffset);
 
         bool isCrouching = false;
+        bool isSprinting = false;
+        float speedMultiplier = 1.0f; // Default walking speed
 
     private:
         void updateCameraVectors();

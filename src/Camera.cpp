@@ -4,20 +4,22 @@ glm::mat4 Camera::getViewMatrix() {
     return glm::lookAt(position, position + front, up);
 }
 
-void Camera::processKeyboard(char direction, float deltaTime) {
+void Camera::processKeyboard(char direction, float deltaTime, bool isCreative) {
     float velocity = speed * deltaTime;
     
-    // Create a "Flat Front" vector (ignore the Y axis for movement)
+    // Calculate directions
     glm::vec3 flatFront = glm::normalize(glm::vec3(front.x, 0.0f, front.z));
     glm::vec3 right = glm::normalize(glm::cross(flatFront, up));
 
-    if (direction == 'W') position += flatFront * velocity;
-    if (direction == 'S') position -= flatFront * velocity;
+    // Determine which forward vector to use
+    // front = true 3D direction (includes looking up/down)
+    // flatFront = walking on a plane
+    glm::vec3 moveForward = isCreative ? front : flatFront;
+
+    if (direction == 'W') position += moveForward * velocity;
+    if (direction == 'S') position -= moveForward * velocity;
     if (direction == 'A') position -= right * velocity;
     if (direction == 'D') position += right * velocity;
-
-    // DO NOT TOUCH isCrouching HERE! 
-    // It is handled by the toggle in Game.cpp
 }
 
 void Camera::processMouse(float xoffset, float yoffset) {
