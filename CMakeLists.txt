@@ -5,10 +5,6 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find SFML
-set(SFML_STATIC_LIBRARIES ON)
-find_package(SFML COMPONENTS Graphics Window System REQUIRED)
-
-find_package(OpenGL REQUIRED)
+find_package(raylib REQUIRED)
 
 add_subdirectory(src)

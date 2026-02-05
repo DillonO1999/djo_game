@@ -1,873 +1,471 @@
 #include "Game.hpp"
-#include <iostream>
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#define TINYOBJLOADER_IMPLEMENTATION // Define this in only *one* .cc file
-#include "tiny_obj_loader.h"
+#include "raylib.h"
+#include "raymath.h"
+#include <vector>
+#include <algorithm>
 
-// --- SHADER SOURCE CODE (GLSL) ---
-const char* vertexShaderSource = R"glsl(
-    #version 330 core
-    layout (location = 0) in vec3 aPos;
-    layout (location = 1) in vec2 aTexCoord;
-    layout (location = 2) in vec3 aNormal; // New
+Game::Game() {
+    InitWindow(1500, 1000, "Real 3D - Raylib Version");
+    SetTargetFPS(60);
+    DisableCursor();
+    SetExitKey(KEY_NULL);
 
-    out vec2 TexCoord;
-    out float slope; // Pass steepness to fragment shader
+    // Ensure the camera isn't looking at itself
+    camera.position = (Vector3){ 400.0f, 50.0f, 400.0f };
+    camera.target   = (Vector3){ 0.0f, 0.0f, 0.0f };
+    camera.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
+    camera.fovy     = 60.0f;
+    camera.projection = CAMERA_PERSPECTIVE;
 
-    uniform mat4 model;
-    uniform mat4 view;
-    uniform mat4 projection;
+    // Reset your manual yaw/pitch to match this look direction
+    cameraYaw = -135.0f; 
+    cameraPitch = -15.0f;
 
-    void main() {
-        gl_Position = projection * view * model * vec4(aPos, 1.0);
-        TexCoord = aTexCoord;
-        // Normal.y tells us how "upward" the surface faces (1.0 = flat, 0.0 = vertical)
-        slope = aNormal.y; 
-    }
-)glsl";
-
-const char* fragmentShaderSource = R"glsl(
-    #version 330 core
-    out vec4 FragColor; // <--- ADD THIS LINE
-    
-    in vec2 TexCoord;
-    in float slope;
-
-    uniform sampler2D grassTexture;
-    uniform sampler2D rockTexture;
-
-    void main() {
-        vec4 grass = texture(grassTexture, TexCoord * 100.0);
-        vec4 rock = texture(rockTexture, TexCoord * 100.0);
-        float blend = smoothstep(0.6, 0.8, slope);
-        FragColor = mix(rock, grass, blend);
-    }
-)glsl";
-
-const char* objectFragmentShaderSource = R"glsl(
-    #version 330 core
-    out vec4 FragColor;
-    in vec2 TexCoord;
-    uniform sampler2D objectTexture;
-
-    void main() {
-        vec4 texColor = texture(objectTexture, TexCoord);
-        if(texColor.a < 0.1) discard; // Support for transparent fences/leaves
-        FragColor = texColor;
-    }
-)glsl";
-
-Game::Game() : pauseText(font), resumeText(font), exitText(font), sensitivityText(font) {
-    sf::ContextSettings settings;
-    settings.depthBits = 24;
-    settings.majorVersion = 3;
-    settings.minorVersion = 3;
-    settings.attributeFlags = sf::ContextSettings::Default;
-
-    // SFML 3 uses sf::State::Windowed instead of sf::Style::Default
-    window.create(sf::VideoMode(sf::VideoMode::getDesktopMode().size), "Real 3D - First Triangle", sf::State::Windowed, settings);
-
-    if (!gladLoadGLLoader((GLADloadproc)sf::Context::getFunction)) {
-        std::cerr << "Failed to initialize GLAD" << std::endl;
-    }
-
-    camera.position = glm::vec3(490.0f, 40.0f, 490.0f); // 2 meters high, slightly back from center
-
+    setupUI(); 
     setupResources();
-
-    windowCenter = sf::Vector2i(window.getSize().x / 2, window.getSize().y / 2);
-    window.setMouseCursorVisible(false); // Hide the cursor
-    sf::Mouse::setPosition(windowCenter, window); // Reset to center
-
-    if (!font.openFromFile("assets/fonts/BBH_Bogle/BBHBogle-Regular.ttf")) {
-        std::cerr << "Error: Could not load font file!" << std::endl;
-        return;
-    }
-
-    setupUI();
-    window.resetGLStates(); // <-- ADD THIS
-    currentState = GameState::Playing; // Start the game in playing mode
+    currentState = GameState::Playing;
 }
 
+// Helper functions
 float Game::getMapHeightAt(float x, float z) {
-    float highestY = -100.0f; // Default "void" height
-    bool foundFloor = false;
-
-    // Loop through triangles (3 vertices at a time, 5 floats per vertex)
-    for (size_t i = 0; i < mapVertices.size(); i += 24) {
-        glm::vec3 v0(mapVertices[i],     mapVertices[i+1], mapVertices[i+2]);
-        glm::vec3 v1(mapVertices[i+8],   mapVertices[i+9], mapVertices[i+10]);
-        glm::vec3 v2(mapVertices[i+16],  mapVertices[i+17], mapVertices[i+18]);
-        
-        // 1. Barycentric Coordinate check: Is (x, z) inside this triangle?
-        float det = (v1.z - v2.z) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.z - v2.z);
-        float l1 = ((v1.z - v2.z) * (x - v2.x) + (v2.x - v1.x) * (z - v2.z)) / det;
-        float l2 = ((v2.z - v0.z) * (x - v2.x) + (v0.x - v2.x) * (z - v2.z)) / det;
-        float l3 = 1.0f - l1 - l2;
-
-        if (l1 >= 0 && l2 >= 0 && l3 >= 0) {
-            // 2. If inside, calculate the Y height at this specific point
-            float h = l1 * v0.y + l2 * v1.y + l3 * v2.y;
-            highestY = std::max(highestY, h);
-            foundFloor = true;
-        }
-    }
-
-    return foundFloor ? highestY : 0.0f; 
-}
-
-void Game::loadMap(const std::string& path) {
-
-    if (mapVAO != 0) glDeleteVertexArrays(1, &mapVAO);
-    if (mapVBO != 0) glDeleteBuffers(1, &mapVBO);
-
-    tinyobj::attrib_t attrib;
-    std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
-    std::string warn, err;
-
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) {
-        std::cerr << "OBJ Loader Error: " << warn << err << std::endl;
-        return;
-    }
-
-    mapVertices.clear();
-
-    for (const auto& shape : shapes) {
-        for (const auto& index : shape.mesh.indices) {
-            // 1. Positions
-            float vx = attrib.vertices[3 * index.vertex_index + 0];
-            float vy = attrib.vertices[3 * index.vertex_index + 1];
-            float vz = attrib.vertices[3 * index.vertex_index + 2];
-            mapVertices.push_back(vx);
-            mapVertices.push_back(vy);
-            mapVertices.push_back(vz);
-
-            // 2. Textures (UVs) - Calculate tx and ty here!
-            float tx = 0.0f, ty = 0.0f;
-            if (index.texcoord_index >= 0) {
-                tx = attrib.texcoords[2 * index.texcoord_index + 0];
-                ty = attrib.texcoords[2 * index.texcoord_index + 1];
-            }
-            mapVertices.push_back(tx);
-            mapVertices.push_back(ty);
-
-            // 3. Normals
-            if (index.normal_index >= 0) {
-                mapVertices.push_back(attrib.normals[3 * index.normal_index + 0]);
-                mapVertices.push_back(attrib.normals[3 * index.normal_index + 1]);
-                mapVertices.push_back(attrib.normals[3 * index.normal_index + 2]);
-            } else {
-                mapVertices.push_back(0.0f); mapVertices.push_back(1.0f); mapVertices.push_back(0.0f);
-            }
-        }
-    }
-
-    // --- OpenGL Setup ---
-    glGenVertexArrays(1, &mapVAO);
-    glGenBuffers(1, &mapVBO);
-
-    glBindVertexArray(mapVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, mapVBO);
-    glBufferData(GL_ARRAY_BUFFER, mapVertices.size() * sizeof(float), mapVertices.data(), GL_STATIC_DRAW);
-
-    // Position (Location 0): 3 floats, starts at 0
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Texture (Location 1): 2 floats, starts after 3 Pos floats
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    // Normals (Location 2): 3 floats, starts after 3 Pos + 2 UV floats
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(2);
+    Ray ray = { { x, 1000.0f, z }, { 0, -1, 0 } }; 
     
-    // Unbind to prevent accidental overrides
-    glBindVertexArray(0); 
+    // We access the first mesh of the model directly
+    // This function is guaranteed to exist based on your error log
+    RayCollision hit = GetRayCollisionMesh(ray, mapModel.meshes[0], mapModel.transform);
+    
+    return (hit.hit) ? hit.point.y : 0.0f;
 }
 
+Vector3 Game::getMapNormalAt(float x, float z) {
+    Ray ray = { { x, 1000.0f, z }, { 0, -1, 0 } };
+    
+    RayCollision hit = GetRayCollisionMesh(ray, mapModel.meshes[0], mapModel.transform);
+    
+    return (hit.hit) ? hit.normal : (Vector3){ 0, 1, 0 };
+}
+
+// Pause Menu setup
+void Game::setupUI() {
+    float sw = (float)GetScreenWidth();
+    float sh = (float)GetScreenHeight();
+    float centerX = sw * 0.5f;
+    float centerY = sh * 0.5f;
+
+    // 1. Pause Menu Box (25% width, 60% height)
+    Vector2 menuSize = { sw * 0.25f, sh * 0.6f };
+    pauseMenuRect = { centerX - menuSize.x/2, centerY - menuSize.y/2, menuSize.x, menuSize.y };
+
+    // 2. Buttons (15% width, 6% height)
+    Vector2 btnSize = { sw * 0.15f, sh * 0.06f };
+    resumeBtnRect = { centerX - btnSize.x/2, centerY - (menuSize.y * 0.05f) - btnSize.y/2, btnSize.x, btnSize.y };
+    exitBtnRect = { centerX - btnSize.x/2, centerY + (menuSize.y * 0.1f) - btnSize.y/2, btnSize.x, btnSize.y };
+
+    // 3. Slider Track
+    Vector2 trackSize = { sw * 0.15f, sh * 0.005f };
+    sliderTrackRect = { centerX - trackSize.x/2, centerY + (menuSize.y * 0.3f), trackSize.x, trackSize.y };
+
+    // 4. Slider Handle
+    Vector2 handleSize = { sw * 0.01f, sh * 0.03f };
+    float t = (sensitivity - 0.01f) / (0.2f - 0.01f); // Calculate normalized position
+    sliderHandleRect = { sliderTrackRect.x + (t * trackSize.x) - handleSize.x/2, 
+                         sliderTrackRect.y + trackSize.y/2 - handleSize.y/2, 
+                         handleSize.x, handleSize.y };
+}
+
+// Load in map, models and textures
 void Game::setupResources() {
-    // Compile shaders
-    unsigned int vs = compileShader(GL_VERTEX_SHADER, vertexShaderSource);
-    unsigned int fs = compileShader(GL_FRAGMENT_SHADER, fragmentShaderSource);
-    unsigned int ofs = compileShader(GL_FRAGMENT_SHADER, objectFragmentShaderSource);
+    // 1. Load the Map Model
+    mapModel = LoadModel("assets/maps/Towers/Towers.obj");
+    grassTexture = LoadTexture("assets/textures/grass.jpg");
+    rockTexture = LoadTexture("assets/textures/black-stone.jpg");
 
-    // --- TERRAIN SHADER ---
-    shaderProgram = glCreateProgram();
-    glAttachShader(shaderProgram, vs);
-    glAttachShader(shaderProgram, fs);
-    glLinkProgram(shaderProgram);
+    // 2. Load the Shader
+    Shader terrainShader = LoadShader("assets/shaders/terrain.vs", "assets/shaders/terrain.fs");
+
+    // Link textures to the shader's sampler2D slots
+    int texGrassLoc = GetShaderLocation(terrainShader, "texture0");
+    int texRockLoc = GetShaderLocation(terrainShader, "texture1");
+
+    // Assign the shader to the map material
+    mapModel.materials[0].shader = terrainShader;
     
-    // Set terrain texture units (Do this once!)
-    glUseProgram(shaderProgram);
-    glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
-    glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
+    // Slot 0 is always MATERIAL_MAP_DIFFUSE
+    mapModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = grassTexture;
+    
+    // Slot 1 is extra (MATERIAL_MAP_SPECULAR or just custom)
+    mapModel.materials[0].maps[MATERIAL_MAP_SPECULAR].texture = rockTexture;
+    
+    // Tell the shader that sampler2D 'texture1' corresponds to texture slot 1
+    int secondSlot = 1;
+    SetShaderValue(terrainShader, texRockLoc, &secondSlot, SHADER_UNIFORM_INT);
 
-    // --- OBJECT SHADER ---
-    objectShaderProgram = glCreateProgram();
-    glAttachShader(objectShaderProgram, vs); // Reuse the same vertex logic
-    glAttachShader(objectShaderProgram, ofs);
-    glLinkProgram(objectShaderProgram);
+    // 2. Load Templates
+    Model fenceModel = LoadModel("assets/objects/Farm Buildings - Sept 2018/OBJ/Fence.obj");
+    Texture2D woodTex = LoadTexture("assets/textures/wood.png");
+    fenceModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = woodTex;
 
-    // Set object texture unit (Do this once!)
-    glUseProgram(objectShaderProgram);
-    glUniform1i(glGetUniformLocation(objectShaderProgram, "objectTexture"), 0);
+    Model treeModel = LoadModel("assets/objects/Ultimate Nature Pack - Jun 2019/OBJ/CommonTree_5.obj");
+    Texture2D leafTex = LoadTexture("assets/textures/leaves.png");
+    treeModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = leafTex;
 
-    // Cleanup
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    glDeleteShader(ofs);
-
-    loadMap("assets/maps/Towers/Towers.obj");
-
-    // Load Grass Texture
-    glGenTextures(1, &grassTextureID);
-    glBindTexture(GL_TEXTURE_2D, grassTextureID);
-    // ... Set parameters (Wrap/Filter) ...
-    sf::Image grassImg;
-    if (grassImg.loadFromFile("assets/textures/grass.jpg")) { // Make sure this path exists!
-        grassImg.flipVertically();
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, grassImg.getSize().x, grassImg.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, grassImg.getPixelsPtr());
-        glGenerateMipmap(GL_TEXTURE_2D);
-    }
-
-    // Load Rock Texture
-    glGenTextures(1, &rockTextureID);
-    glBindTexture(GL_TEXTURE_2D, rockTextureID);
-    // ... Set parameters (Wrap/Filter) ...
-    sf::Image rockImg;
-    if (rockImg.loadFromFile("assets/textures/black-stone.jpg")) { // Make sure this path exists!
-        rockImg.flipVertically();
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rockImg.getSize().x, rockImg.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, rockImg.getPixelsPtr());
-        glGenerateMipmap(GL_TEXTURE_2D);
-    }
-
-    // 3. LOAD TEMPLATES ONCE (The "Heavy" part)
-    GameObject fenceTemplate;
-    loadObject(fenceTemplate, "assets/objects/Farm Buildings - Sept 2018/OBJ/Fence.obj", "assets/textures/wood.png");
-
-    GameObject treeTemplate;
-    loadObject(treeTemplate, "assets/objects/Ultimate Nature Pack - Jun 2019/OBJ/CommonTree_5.obj", "assets/textures/leaves.png");
-
-    // 4. THE FENCE LOOP (The "Fast" part)
+    // 3. FENCE LOOP
     for (int i = 0; i < 4000; i += 6) {
-        GameObject f = fenceTemplate; // Copying the VAO/VBO IDs, not reloading files
+        GameObject f;
+        f.model = fenceModel;
+        f.scale = { 1.0f, 1.0f, 1.0f };
 
-        // Use corrected C++ logic: (i >= min && i < max)
-        if (i >= 0 && i < 1000) {
-            f.position = glm::vec3(498.0f - static_cast<float>(i), 0.0f, 498.0f);
-            f.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
-        } else if (i >= 1000 && i < 2000) {
-            f.position = glm::vec3(-498.0f, 0.0f, 498.0f - static_cast<float>(i - 1000));
-            f.rotation = glm::vec3(0.0f, 90.0f, 0.0f); // Rotate Y to turn the corner
-        } else if (i >= 2000 && i < 3000) {
-            f.position = glm::vec3(-498.0f + static_cast<float>(i - 2000), 0.0f, -498.0f);
-            f.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
-        } else if (i >= 3000 && i < 4000) {
-            f.position = glm::vec3(498.0f, 0.0f, -498.0f + static_cast<float>(i - 3000));
-            f.rotation = glm::vec3(0.0f, 90.0f, 0.0f);
+        // Position Logic
+        if (i < 1000) {
+            f.position = { 498.0f - (float)i, 0.0f, 498.0f };
+            f.rotation = { 0, 0, 0 };
+        } else if (i < 2000) {
+            f.position = { -498.0f, 0.0f, 498.0f - (float)(i - 1000) };
+            f.rotation = { 0, 90.0f, 0 };
+        } else if (i < 3000) {
+            f.position = { -498.0f + (float)(i - 2000), 0.0f, -498.0f };
+            f.rotation = { 0, 0, 0 };
+        } else {
+            f.position = { 498.0f, 0.0f, -498.0f + (float)(i - 3000) };
+            f.rotation = { 0, 90.0f, 0 };
         }
 
-        // 2. FETCH the data from the map (Height and Normal)
+        // 2. Get the ground normal for this spot
+        Vector3 normal = getMapNormalAt(f.position.x, f.position.z);
+        
+        // 3. Store the normal so we can use it in the draw loop
+        f.groundNormal = normal;
+
+        // Snap to terrain height
         f.position.y = getMapHeightAt(f.position.x, f.position.z);
-        glm::vec3 groundNormal = getMapNormalAt(f.position.x, f.position.z); // Create it here!
-        f.groundNormal = groundNormal; // Store it for later
-
-        // 3. DO the math using that groundNormal
-        glm::vec3 worldUp(0, 1, 0);
-        float dot = glm::clamp(glm::dot(worldUp, groundNormal), -1.0f, 1.0f);
-        float angle = acos(dot);
-        glm::vec3 axis = glm::cross(worldUp, groundNormal);
-
-        glm::mat4 slopeRotation = glm::mat4(1.0f);
-        if (glm::length(axis) > 0.001f) {
-            slopeRotation = glm::rotate(glm::mat4(1.0f), angle, glm::normalize(axis));
-        }
-
-        // 4. BUILD the final matrix
-        f.modelMatrix = glm::translate(glm::mat4(1.0f), f.position) * slopeRotation * glm::rotate(glm::mat4(1.0f), glm::radians(f.rotation.y), worldUp) * glm::scale(glm::mat4(1.0f), f.scale);
-
-        // 5. FINALLY push to the list
         sceneObjects.push_back(f);
+
+        // Every 500 fences, tell the OS we are still working
+        if (i % 500 == 0) {
+            PollInputEvents(); // Keeps the window responsive during the heavy loop
+        }
     }
 
-    // 5. THE TREE LOOP
+    // 4. TREE LOOP
     for (int i = 0; i < 50; i++) {
-        GameObject t = treeTemplate;
-        float rx = -100.0f + static_cast<float>(-(rand() % 375));
-        float rz = 100.0f + static_cast<float>(rand() % 375);
+        GameObject t;
+        t.model = treeModel;
+        t.isTree = true;
 
-        // 1. Get Height and Normal
+        float rx = -100.0f + (float)(-(rand() % 375));
+        float rz = 100.0f + (float)(rand() % 375);
         float groundY = getMapHeightAt(rx, rz);
-        glm::vec3 groundNormal = getMapNormalAt(rx, rz);
         
-        t.position = glm::vec3(rx, groundY, rz);
+        t.position = { rx, groundY, rz };
         
-        // 2. Random Scale & Rotation
-        float s = 10.0f + static_cast<float>(rand() % 201) / 10.0f;
-        t.scale = glm::vec3(s, s, s);
-        float randomYaw = static_cast<float>(rand() % 360);
+        // Random Scale & Rotation
+        float s = 10.0f + (float)(rand() % 201) / 10.0f;
+        t.scale = { s, s, s };
+        t.rotation = { 0, (float)(rand() % 360), 0 };
 
-        // 3. Calculate Slope Matrix (Just like the fences!)
-        glm::vec3 worldUp(0, 1, 0);
-        float dot = glm::clamp(glm::dot(worldUp, groundNormal), -1.0f, 1.0f);
-        float angle = acos(dot);
-        glm::vec3 axis = glm::cross(worldUp, groundNormal);
+        // Slope Alignment Logic (Optional in Raylib - simpler to just set position)
+        t.groundNormal = getMapNormalAt(rx, rz);
 
-        glm::mat4 slopeRotation = glm::mat4(1.0f);
-        if (glm::length(axis) > 0.001f) {
-            slopeRotation = glm::rotate(glm::mat4(1.0f), angle, glm::normalize(axis));
-        }
-
-        // 4. Final Matrix Construction
-        t.modelMatrix = glm::translate(glm::mat4(1.0f), t.position) * slopeRotation * glm::rotate(glm::mat4(1.0f), glm::radians(randomYaw), worldUp) * glm::scale(glm::mat4(1.0f), t.scale);
-        t.isTree = true; 
-        
         sceneObjects.push_back(t);
     }
 
-    GameObject TowerWindmill;
-    loadObject(TowerWindmill, "assets/objects/Farm Buildings - Sept 2018/OBJ/TowerWindmill.obj", "assets/textures/wood.png");
-    TowerWindmill.position = glm::vec3(400.0f, getMapHeightAt(400.0f, -400.0f), -400.0f);
-    TowerWindmill.scale = glm::vec3(15.0f,15.0f,15.0f);
-    TowerWindmill.rotation = glm::vec3(0.0f, -45.0f, 0.0f);
-    sceneObjects.push_back(TowerWindmill);
+    // // Windmill
+    // GameObject tower;
+    // tower.model = LoadModel("assets/objects/Farm Buildings - Sept 2018/OBJ/TowerWindmill.obj");
+    // tower.texture = LoadTexture("assets/textures/wood.png");
+    // tower.model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = tower.texture; // Apply texture
+    // tower.position = { 400.0f, getMapHeightAt(400.0f, -400.0f), -400.0f };
+    // tower.scale = { 15.0f, 15.0f, 15.0f };
+    // tower.rotation = { 0, -45.0f, 0 };
+    // sceneObjects.push_back(tower);
 
-    GameObject Barn;
-    loadObject(Barn, "assets/objects/Farm Buildings - Sept 2018/OBJ/OpenBarn.obj", "assets/textures/wood.png");
-    Barn.position = glm::vec3(-400.0f, getMapHeightAt(-400.0f, -400.0f), -400.0f);
-    Barn.scale = glm::vec3(15.0f,15.0f,15.0f);
-    Barn.rotation = glm::vec3(0.0f, 45.0f, 0.0f);
-    sceneObjects.push_back(Barn);
+    // // Barn
+    // GameObject barn;
+    // barn.model = LoadModel("assets/objects/Farm Buildings - Sept 2018/OBJ/OpenBarn.obj");
+    // barn.texture = LoadTexture("assets/textures/wood.png");
+    // barn.model.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = barn.texture; // Apply texture
+    // barn.position = { -400.0f, getMapHeightAt(-400.0f, -400.0f), -400.0f };
+    // barn.scale = { 15.0f, 15.0f, 15.0f };
+    // barn.rotation = { 0, 45.0f, 0 };
+    // sceneObjects.push_back(barn);
 }
 
-unsigned int Game::compileShader(unsigned int type, const char* source) {
-    unsigned int id = glCreateShader(type);
-    glShaderSource(id, 1, &source, nullptr);
-    glCompileShader(id);
-
-    // Check for compilation errors
-    int success;
-    char infoLog[512];
-    glGetShaderiv(id, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        glGetShaderInfoLog(id, 512, NULL, infoLog);
-        std::cerr << "ERROR: Shader Compilation Failed (" 
-                  << (type == GL_VERTEX_SHADER ? "VERTEX" : "FRAGMENT") 
-                  << ")\n" << infoLog << std::endl;
-    }
-    return id;
-}
-
-void Game::run() {
-    sf::Clock clock;
-
-    glDisable(GL_CULL_FACE);
-    
-    // Enable Depth Testing so objects behind others are hidden correctly
-    glEnable(GL_DEPTH_TEST); 
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    while (window.isOpen()) {
-        float deltaTime = clock.restart().asSeconds();
-        processEvents(deltaTime);
-
-        // 1. Clear the screen AND the depth buffer
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-        glEnable(GL_DEPTH_TEST); // Ensure this is on
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); 
-
-        // 2. IMPORTANT: Reset Depth Mask before drawing 3D
-        glDepthMask(GL_TRUE); 
-        glDepthFunc(GL_LESS);
-
-        glUseProgram(shaderProgram);
-
-        // Re-enable these!
-        unsigned int modelLoc = glGetUniformLocation(shaderProgram, "model");
-        unsigned int viewLoc  = glGetUniformLocation(shaderProgram, "view");
-        unsigned int projLoc  = glGetUniformLocation(shaderProgram, "projection");
-
-        glm::mat4 view = camera.getViewMatrix();
-        float aspect = window.getSize().x / (float)window.getSize().y;
-        glm::mat4 projection = glm::perspective(glm::radians(45.0f), aspect, 1.0f, 10000.0f);
-
-        glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(view));
-        glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(projection));
-
-        glBindVertexArray(mapVAO);
-        glm::mat4 model = glm::mat4(1.0f); 
-        glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(model));
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, grassTextureID);
-        glUniform1i(glGetUniformLocation(shaderProgram, "grassTexture"), 0);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, rockTextureID);
-        glUniform1i(glGetUniformLocation(shaderProgram, "rockTexture"), 1);
-
-        glDrawArrays(GL_TRIANGLES, 0, mapVertices.size() / 8); // Divide by 8 now!
-
-        // 2. Draw all other objects
-        for (auto& obj : sceneObjects) {
-            glUniformMatrix4fv(modelLoc, 1, GL_FALSE, glm::value_ptr(obj.getModelMatrix()));
-            glBindVertexArray(obj.VAO);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, obj.textureID);
-            
-            // Note: We use a different uniform for object texture since map uses two textures
-            // You might want a simpler "StaticObjectShader" for single-texture objects
-            glDrawArrays(GL_TRIANGLES, 0, obj.vertexCount);
-        }
-
-        window.resetGLStates();
-
-        if (currentState == GameState::Paused) {
-            // 1. Tell the GPU to stop using your 3D shader
-            glUseProgram(0); 
-            glBindVertexArray(0);
-
-            // 2. Save 3D state and reset for SFML
-            window.pushGLStates(); 
-
-            // 3. Clear depth and reset view for 2D
-            glClear(GL_DEPTH_BUFFER_BIT);
-            window.setView(window.getDefaultView());
-
-            // Draw boxes first
-            window.draw(pauseOverlay);
-            window.draw(pauseMenu);
-            window.draw(resumeBtn);
-            window.draw(exitBtn);
-
-            // Draw text on top of boxes
-            window.draw(pauseText);
-            window.draw(resumeText);
-            window.draw(exitText);
-
-            // Draw slider last
-            window.draw(sensitivityText);
-            window.draw(sensitivityTrack);
-            window.draw(sensitivityHandle);
-
-            // 5. Restore 3D settings
-            window.popGLStates();
-        }
-        // 4. Show the result
-        window.display();
-    }
-}
-
+// Process key presses and events
 void Game::processEvents(float deltaTime) {
-    while (const std::optional<sf::Event> event = window.pollEvent()) {
-        if (event->is<sf::Event::Closed>()) window.close();
-        
-        if (const auto* keyPressed = event->getIf<sf::Event::KeyPressed>()) {
-            // Global Toggles
-            // Handle Pause Toggle
-            if (keyPressed->code == sf::Keyboard::Key::Escape) {
-                if (currentState == GameState::Playing) {
-                    currentState = GameState::Paused;
-                    window.setMouseCursorVisible(true);
-                } else {
-                    currentState = GameState::Playing;
-                    window.setMouseCursorVisible(false);
-                }
-            }
-
-            // --- CROUCH TOGGLE ---
-            if (keyPressed->code == sf::Keyboard::Key::C && currentState == GameState::Playing) {
-                camera.isCrouching = !camera.isCrouching; // Flip the state
-            }
-
-            // --- SPRINT TOGGLE ---
-            if (keyPressed->code == sf::Keyboard::Key::LShift && currentState == GameState::Playing) {
-                camera.isSprinting = !camera.isSprinting; // Flip the state
-            }
-            
-            // TODO: make this a button in pause menu
-            if (keyPressed->code == sf::Keyboard::Key::G && currentState == GameState::Playing) {
-                isCreativeMode = !isCreativeMode;
-                // Reset velocity when entering/exiting to prevent "sliding"
-                camera.verticalVelocity = 0.0f; 
-            }
+    // --- 1. GLOBAL INPUTS (Always active) ---
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        if (currentState == GameState::Playing) {
+            currentState = GameState::Paused;
+            EnableCursor(); // Show mouse
+        } else {
+            currentState = GameState::Playing;
+            DisableCursor(); // Hide mouse
         }
     }
 
-    
     if (currentState == GameState::Playing) {
-        // --- 1. SET DYNAMIC SPEED ---
+        // --- 2. TOGGLES ---
+        if (IsKeyPressed(KEY_C)) isCrouching = !isCrouching;
+        if (IsKeyPressed(KEY_LEFT_SHIFT)) isSprinting = !isSprinting;
+        if (IsKeyPressed(KEY_G)) {
+            isCreativeMode = !isCreativeMode;
+            verticalVelocity = 0.0f;
+        }
+
+        // --- 3. DYNAMIC SPEED ---
         float baseSpeed = isCreativeMode ? 90.0f : 7.0f;
         float targetMult = 1.0f;
-        if (camera.isSprinting) targetMult = 1.7f;
-        if (camera.isCrouching) targetMult = 0.4f;
+        // And this:
+        if (isSprinting) targetMult = 1.7f;
+        if (isCrouching) targetMult = 0.4f;
 
-        camera.speedMultiplier = glm::mix(camera.speedMultiplier, targetMult, 3.0f * deltaTime);
-        camera.speed = baseSpeed * camera.speedMultiplier;
+        // Lerp speed multiplier
+        speedMultiplier = Lerp(speedMultiplier, targetMult, 12.0f * deltaTime);
+        float currentSpeed = baseSpeed * speedMultiplier;
 
-        // 2. JUMP INPUT (Move this UP!)
-        if (!isCreativeMode && sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space) && camera.isGrounded) {
-            camera.verticalVelocity = 7.0f;
-            camera.isGrounded = false;
-        }
+        // --- 4. MOVEMENT & COLLISION PREP ---
+        Vector3 nextPos = camera.position;
 
-        // --- 2. PRE-MOVEMENT CHECK ---
-        glm::vec3 oldPos = camera.position;
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::W)) camera.processKeyboard('W', deltaTime, isCreativeMode);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S)) camera.processKeyboard('S', deltaTime, isCreativeMode);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::A)) camera.processKeyboard('A', deltaTime, isCreativeMode);
-        if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::D)) camera.processKeyboard('D', deltaTime, isCreativeMode);
+        // Calculate the true direction vector
+        Vector3 lookDir = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+        Vector3 forward = lookDir;
 
         if (!isCreativeMode) {
-            glm::vec3 nextNormal = getMapNormalAt(camera.position.x, camera.position.z);
-            const float slopeLimit = 0.6f;
-            if (nextNormal.y < slopeLimit && camera.isGrounded) {
-                camera.position.x = oldPos.x;
-                camera.position.z = oldPos.z;
-            }
+            forward.y = 0; // Lock to ground for walking
+            forward = Vector3Normalize(forward);
         }
 
-        // 4. PHYSICS PREP
+        Vector3 right = Vector3CrossProduct(forward, camera.up);
+
+        if (IsKeyDown(KEY_W)) nextPos = Vector3Add(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
+        if (IsKeyDown(KEY_S)) nextPos = Vector3Subtract(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
+        if (IsKeyDown(KEY_A)) nextPos = Vector3Subtract(camera.position, Vector3Scale(right, currentSpeed * deltaTime));
+        if (IsKeyDown(KEY_D)) nextPos = Vector3Add(camera.position, Vector3Scale(right, currentSpeed * deltaTime));
+
+        // 2. Smooth Boundary Check (Slide along the wall)
+        const float mapLimit = 497.5f; // Stay slightly inside the actual 500 edge
+
+        if (nextPos.x > mapLimit)  nextPos.x = mapLimit;
+        if (nextPos.x < -mapLimit) nextPos.x = -mapLimit;
+        if (nextPos.z > mapLimit)  nextPos.z = mapLimit;
+        if (nextPos.z < -mapLimit) nextPos.z = -mapLimit;
+
+        // 3. Finally, apply the safe position
+        camera.position = nextPos;
+
+        // --- 5. PHYSICS & SLOPES ---
         float terrainHeight = getMapHeightAt(camera.position.x, camera.position.z);
-        glm::vec3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
-        
-        // SMOOTH CROUCH FIX: Interpolate the OFFSET, not the total Y
-        float targetEyeHeight = camera.isCrouching ? 0.8f : 1.5f;
-        camera.currentEyeHeight = glm::mix(camera.currentEyeHeight, targetEyeHeight, 8.0f * deltaTime);
-        
-        float floorY = terrainHeight + camera.currentEyeHeight;
+        Vector3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
 
-        // 5. VERTICAL PHYSICS (Apply gravity BEFORE checking collision)
-        if (isCreativeMode) {
-            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::Space)) camera.position.y += camera.speed * deltaTime;
-            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LControl)) camera.position.y -= camera.speed * deltaTime;
-            if (camera.position.y < floorY) camera.position.y = floorY;
-            camera.verticalVelocity = 0.0f;
-        } else {
-            // Apply Gravity first
-            if (!camera.isGrounded) {
-                camera.verticalVelocity -= 15.0f * deltaTime;
+        float targetEyeHeight = isCrouching ? 0.8f : 1.5f;
+        currentEyeHeight = Lerp(currentEyeHeight, targetEyeHeight, 12.0f * deltaTime);
+        float floorY = terrainHeight + currentEyeHeight;
+
+        // SNAP LOGIC: If we are very close to the floor, just snap to it
+        float snapDistance = 0.5f; 
+
+        if (!isCreativeMode) {
+            // Gravity logic
+            if (!isGrounded) verticalVelocity -= 15.0f * deltaTime;
+            camera.position.y += verticalVelocity * deltaTime;
+
+            // Inside processEvents, under the !isCreativeMode branch:
+            if (IsKeyPressed(KEY_SPACE) && isGrounded) {
+                verticalVelocity = 7.0f;
+                isGrounded = false; // This tells the physics "we are in the air now"
             }
-            camera.position.y += camera.verticalVelocity * deltaTime;
 
-            // --- 6. GROUND COLLISION & ILLEGAL SLOPE CHECK ---
+            // Check collision
             const float slopeLimit = 0.6f;
-            float snapDistance = 0.5f;
-
-            // Check if we are hitting the floor
-            bool hittingFloor = (camera.position.y <= floorY);
-            // Check if we are close enough to snap (downhill running)
-            bool shouldSnap = (camera.isGrounded && camera.position.y <= floorY + snapDistance && camera.verticalVelocity <= 0.1f);
-
-            if (hittingFloor || shouldSnap) {
-                // We are touching the terrain... but is it a walkable slope?
+            
+            // Improved check: If below floor OR very close to it while not jumping
+            if (camera.position.y <= floorY + snapDistance && verticalVelocity <= 0) {
                 if (groundNormal.y >= slopeLimit) {
-                    // VALID GROUND: Snap to floor and stop falling
-                    camera.position.y = floorY;
-                    camera.verticalVelocity = 0.0f;
-                    camera.isGrounded = true;
-                } 
-                else {
-                    // ILLEGAL SLOPE: Force sliding state
-                    camera.isGrounded = false; // This is the key! Never stay grounded here.
-                    
-                    // Calculate downhill direction
-                    glm::vec3 worldDown(0.0f, -1.0f, 0.0f);
-                    glm::vec3 slideDir = worldDown - (groundNormal * glm::dot(worldDown, groundNormal));
-                    
-                    if (glm::length(slideDir) > 0.001f) {
-                        slideDir = glm::normalize(slideDir);
-                        float slideSpeed = 15.0f; // Fast enough to overpower walking
-                        camera.position.x += slideDir.x * slideSpeed * deltaTime;
-                        camera.position.z += slideDir.z * slideSpeed * deltaTime;
-                    }
-
-                    // IMPORTANT: If we hit a steep slope, we stay slightly above it
-                    // so that the gravity code below continues to pull us down.
-                    if (camera.position.y < floorY + 0.05f) {
-                        camera.position.y = floorY + 0.05f;
-                    }
+                    camera.position.y = floorY; // SNAP to ground
+                    verticalVelocity = 0.0f;
+                    isGrounded = true;
+                } else {
+                    // Slide logic for steep slopes
+                    isGrounded = false;
+                    Vector3 slideDir = Vector3Scale(Vector3{groundNormal.x, 0, groundNormal.z}, 15.0f * deltaTime);
+                    camera.position = Vector3Add(camera.position, slideDir);
+                    camera.position.y = floorY + 0.05f;
                 }
-            } 
-            else {
-                // TRULY IN THE AIR
-                camera.isGrounded = false;
+            } else {
+                isGrounded = false;
+            }
+        } else if (isCreativeMode) {
+            // 2. Manual height control (Space/Ctrl)
+            if (IsKeyDown(KEY_SPACE)) camera.position.y += currentSpeed * deltaTime;
+            if (IsKeyDown(KEY_LEFT_CONTROL)) camera.position.y -= currentSpeed * deltaTime;
+
+            // 3. THE FIX: Ground Clamp
+            // This prevents flying through the floor while in Creative Mode
+            if (camera.position.y < floorY) {
+                camera.position.y = floorY;
             }
         }
 
-        // Mouse Look - CALCULATE EVERY FRAME
-        sf::Vector2i mousePos = sf::Mouse::getPosition(window);
-        if (mousePos != windowCenter) { // Only process if the mouse actually moved
-            float xoffset = (float)(mousePos.x - windowCenter.x) * sensitivity;
-            float yoffset = (float)(windowCenter.y - mousePos.y) * sensitivity; 
+        // --- 6. MOUSE LOOK (MANUAL VERSION) ---
+        Vector2 mouseDelta = GetMouseDelta();
 
-            camera.processMouse(xoffset, yoffset);
-            sf::Mouse::setPosition(windowCenter, window); // Reset to center
-        }
+        // 1. Update your internal Yaw and Pitch (add these to your Game or Camera class)
+        // We use negative mouseDelta.y because screen coordinates are inverted
+        cameraYaw   += (mouseDelta.x * sensitivity);
+        cameraPitch -= (mouseDelta.y * sensitivity);
 
-        // --- PERIMETER COLLISION ---
-        const float boundary = 497.0f; // Slightly inside the 498 fence line
+        // 2. Clamp Pitch to prevent the camera from flipping over (somewhat less than 90 degrees)
+        if (cameraPitch > 89.0f)  cameraPitch = 89.0f;
+        if (cameraPitch < -89.0f) cameraPitch = -89.0f;
 
-        // Check X boundary
-        if (camera.position.x > boundary)  camera.position.x = boundary;
-        if (camera.position.x < -boundary) camera.position.x = -boundary;
+        // 3. Calculate the Direction Vector from Yaw/Pitch
+        // Standard 3D Cartesian conversion
+        Vector3 direction;
+        direction.x = cosf(DEG2RAD * cameraYaw) * cosf(DEG2RAD * cameraPitch);
+        direction.y = sinf(DEG2RAD * cameraPitch);
+        direction.z = sinf(DEG2RAD * cameraYaw) * cosf(DEG2RAD * cameraPitch);
 
-        // Check Z boundary
-        if (camera.position.z > boundary)  camera.position.z = boundary;
-        if (camera.position.z < -boundary) camera.position.z = -boundary;
+        // 4. Update the Camera Target
+        // The target is just the camera's position + the direction we are looking
+        camera.target = Vector3Add(camera.position, direction);
 
-        // After movement keys, check against every tree
+        // --- 7. TREE COLLISION ---
         for (auto& obj : sceneObjects) {
-            // We only care about objects that should have collision (like trees)
-            // You can add a 'bool hasCollision' to your GameObject struct
-            if (obj.isTree) { 
-                float dx = camera.position.x - obj.position.x;
-                float dz = camera.position.z - obj.position.z;
-                float distanceSquared = dx*dx + dz*dz;
-                float radius = 2.0f * obj.scale[0] / 10.0f; // The thickness of the tree trunk
-
-                if (distanceSquared < radius * radius) {
-                    // Collision detected! Push the player back
-                    float distance = sqrt(distanceSquared);
-                    float overlap = radius - distance;
-                    
-                    // Move camera away from tree center
-                    camera.position.x += (dx / distance) * overlap;
-                    camera.position.z += (dz / distance) * overlap;
+            if (obj.isTree) {
+                float dist = Vector2Distance({camera.position.x, camera.position.z}, {obj.position.x, obj.position.z});
+                float radius = 2.0f * obj.scale.x / 10.0f;
+                if (dist < radius) {
+                    Vector2 push = Vector2Scale(Vector2Normalize(Vector2Subtract({camera.position.x, camera.position.z}, {obj.position.x, obj.position.z})), radius - dist);
+                    camera.position.x += push.x;
+                    camera.position.z += push.y;
                 }
             }
         }
-    }
+    } // Inside the Paused branch of processEvents
+    else if (currentState == GameState::Paused) {
+        Vector2 mousePos = GetMousePosition();
 
-    if (currentState == GameState::Paused) {
-        // 1. Get the pixel position first
-        sf::Vector2i pixelPos = sf::Mouse::getPosition(window);
-        
-        // 2. Convert it to world/UI coordinates
-        sf::Vector2f mouseCoords = window.mapPixelToCoords(pixelPos);
-
-        // Now use mouseCoords for everything else
-        if (sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) {
-            if (resumeBtn.getGlobalBounds().contains(mouseCoords)) {
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            if (CheckCollisionPointRec(mousePos, resumeBtnRect)) {
                 currentState = GameState::Playing;
-                window.setMouseCursorVisible(false);
-                sf::Mouse::setPosition(windowCenter, window);
+                DisableCursor();
             }
-            
-            if (exitBtn.getGlobalBounds().contains(mouseCoords)) {
-                window.close();
+            if (CheckCollisionPointRec(mousePos, exitBtnRect)) {
+                // No easy way to break the loop here, so:
+                // Either use a flag or just call exit(0)
+                exit(0); 
             }
-            
-            if (sensitivityHandle.getGlobalBounds().contains(mouseCoords)) {
-                draggingSlider = true;
-            }
+            if (CheckCollisionPointRec(mousePos, sliderHandleRect)) draggingSlider = true;
         }
 
-        if (sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) {
-            // If clicking the handle, start dragging
-            if (sensitivityHandle.getGlobalBounds().contains(mouseCoords)) {
-                draggingSlider = true;
-            }
+        if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) draggingSlider = false;
 
-            if (draggingSlider) {
-               float trackWidth = sensitivityTrack.getSize().x;
-    
-                // Because the track origin is centered, the left edge is:
-                // Position.x MINUS half the width
-                float minX = sensitivityTrack.getPosition().x - (trackWidth * 0.5f);
-                float maxX = minX + trackWidth;
-
-                // Clamp the mouse X position between the true edges
-                float newX = std::clamp(mouseCoords.x, minX, maxX);
-
-                sensitivityHandle.setPosition({newX, sensitivityHandle.getPosition().y});
-
-                // Calculate the 0.0 to 1.0 ratio (t) correctly
-                float t = (newX - minX) / trackWidth;
-
-                // Apply to sensitivity range
-                float minSens = 0.01f;
-                float maxSens = 0.2f;
-                sensitivity = minSens + t * (maxSens - minSens);
-            }
-        } else {
-            draggingSlider = false;
+        if (draggingSlider) {
+            float mouseX = Clamp(mousePos.x, sliderTrackRect.x, sliderTrackRect.x + sliderTrackRect.width);
+            float t = (mouseX - sliderTrackRect.x) / sliderTrackRect.width;
+            sensitivity = Lerp(0.01f, 0.2f, t);
         }
     }
 }
 
-glm::vec3 Game::getMapNormalAt(float x, float z) {
-    // 8 floats per vertex: Pos(3), Tex(2), Norm(3)
-    // 3 vertices per triangle = 24 floats
-    for (size_t i = 0; i < mapVertices.size(); i += 24) {
-        glm::vec3 v0(mapVertices[i],     mapVertices[i+1], mapVertices[i+2]);
-        glm::vec3 v1(mapVertices[i+8],   mapVertices[i+9], mapVertices[i+10]);
-        glm::vec3 v2(mapVertices[i+16],  mapVertices[i+17], mapVertices[i+18]);
+// Run the game by calling process_events and drawing everything
+void Game::run() {
+    while (!WindowShouldClose()) {
+        float deltaTime = GetFrameTime();
+        
+        // Update logic
+        processEvents(deltaTime);
 
-        float det = (v1.z - v2.z) * (v0.x - v2.x) + (v2.x - v1.x) * (v0.z - v2.z);
-        float l1 = ((v1.z - v2.z) * (x - v2.x) + (v2.x - v1.x) * (z - v2.z)) / det;
-        float l2 = ((v2.z - v0.z) * (x - v2.x) + (v0.x - v2.x) * (z - v2.z)) / det;
-        float l3 = 1.0f - l1 - l2;
+        BeginDrawing();
+            ClearBackground(SKYBLUE);
 
-        if (l1 >= 0 && l2 >= 0 && l3 >= 0) {
-            // Normals start at index + 5
-            glm::vec3 n0(mapVertices[i+5],  mapVertices[i+6],  mapVertices[i+7]);
-            glm::vec3 n1(mapVertices[i+13], mapVertices[i+14], mapVertices[i+15]);
-            glm::vec3 n2(mapVertices[i+21], mapVertices[i+22], mapVertices[i+23]);
+            BeginMode3D(camera);
+                // Draw the Map
+                DrawModel(mapModel, {0,0,0}, 1.0f, WHITE);
 
-            // Blend the normals based on where you are in the triangle
-            return glm::normalize(l1 * n0 + l2 * n1 + l3 * n2);
-        }
+                // Draw all objects with their specific rotation and scale
+                for (auto& obj : sceneObjects) {
+                    if (obj.isTree) {
+                        // Trees usually grow straight up regardless of slope
+                        DrawModelEx(obj.model, obj.position, {0, 1, 0}, obj.rotation.y, obj.scale, WHITE);
+                    } else {
+                        // Fences should align to the ground normal
+                        // Rotate {0,1,0} (default up) to match groundNormal
+                        Quaternion q = QuaternionFromVector3ToVector3({0, 1, 0}, obj.groundNormal);
+                        
+                        // Combine with the fence's path rotation (around the new normal)
+                        Quaternion pathRot = QuaternionFromAxisAngle(obj.groundNormal, obj.rotation.y * DEG2RAD);
+                        Quaternion finalRot = QuaternionMultiply(pathRot, q);
+                        
+                        // Convert back to Axis-Angle for DrawModelEx
+                        Vector3 axis;
+                        float angle;
+                        QuaternionToAxisAngle(finalRot, &axis, &angle);
+                        
+                        DrawModelEx(obj.model, obj.position, axis, angle * RAD2DEG, obj.scale, WHITE);
+                    }
+                }
+            EndMode3D();
+
+            // --- 2D UI LAYER ---
+            if (currentState == GameState::Playing) {
+                if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+                    int centerX = GetScreenWidth() / 2;
+                    int centerY = GetScreenHeight() / 2;
+                    DrawCircle(centerX, centerY, 4, WHITE); // Clean dot crosshair
+                    DrawCircleLines(centerX, centerY, 10, Fade(WHITE, 0.5f)); // Subtle ring
+                }
+            }
+
+            if (currentState == GameState::Paused) {
+                float sw = (float)GetScreenWidth();
+                float sh = (float)GetScreenHeight();
+
+                // 1. Dark Overlay
+                DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(BLACK, 0.7f));
+
+                // 2. Menu Background
+                DrawRectangleRec(pauseMenuRect, Color{ 40, 40, 40, 220 });
+
+                // 3. Title Text
+                int fontSize = (int)(sh * 0.05f);
+                int textWidth = MeasureText("PAUSED", fontSize);
+                DrawText("PAUSED", sw/2 - textWidth/2, pauseMenuRect.y + (pauseMenuRect.height * 0.05f), fontSize, WHITE);
+
+                // 4. Buttons
+                DrawRectangleRec(resumeBtnRect, Color{ 0, 0, 0, 180 });
+                DrawRectangleRec(exitBtnRect, Color{ 0, 0, 0, 180 });
+
+                // 5. Button Labels (Using 60% of button height)
+                int labelSize = (int)(resumeBtnRect.height * 0.6f);
+                DrawText("RESUME", resumeBtnRect.x + (resumeBtnRect.width/2 - MeasureText("RESUME", labelSize)/2), 
+                        resumeBtnRect.y + (resumeBtnRect.height/2 - labelSize/2), labelSize, WHITE);
+                
+                DrawText("EXIT", exitBtnRect.x + (exitBtnRect.width/2 - MeasureText("EXIT", labelSize)/2), 
+                        exitBtnRect.y + (exitBtnRect.height/2 - labelSize/2), labelSize, WHITE);
+
+                // 6. Sensitivity Slider
+                DrawRectangleRec(sliderTrackRect, GRAY);
+                
+                // Update handle position based on live sensitivity
+                float t = (sensitivity - 0.01f) / (0.2f - 0.01f);
+                sliderHandleRect.x = sliderTrackRect.x + (t * sliderTrackRect.width) - sliderHandleRect.width/2;
+                DrawRectangleRec(sliderHandleRect, WHITE);
+
+                DrawText("MOUSE SENSITIVITY", sw/2 - MeasureText("MOUSE SENSITIVITY", 20)/2, 
+                        sliderTrackRect.y - 40, 20, WHITE);
+            }
+
+        EndDrawing();
     }
-    return glm::vec3(0.0f, 1.0f, 0.0f); // Default to flat ground if not found
-}
-
-void Game::loadObject(GameObject& obj, const std::string& path, const std::string& texPath) {
-    tinyobj::attrib_t attrib;
-    std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
-    std::string warn, err;
-
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) return;
-
-    std::vector<float> vertices;
-    for (const auto& shape : shapes) {
-        for (const auto& index : shape.mesh.indices) {
-            // Position
-            vertices.push_back(attrib.vertices[3 * index.vertex_index + 0]);
-            vertices.push_back(attrib.vertices[3 * index.vertex_index + 1]);
-            vertices.push_back(attrib.vertices[3 * index.vertex_index + 2]);
-            // UVs
-            if (index.texcoord_index >= 0) {
-                vertices.push_back(attrib.texcoords[2 * index.texcoord_index + 0]);
-                vertices.push_back(attrib.texcoords[2 * index.texcoord_index + 1]);
-            } else { vertices.push_back(0.0f); vertices.push_back(0.0f); }
-            // Normals
-            if (index.normal_index >= 0) {
-                vertices.push_back(attrib.normals[3 * index.normal_index + 0]);
-                vertices.push_back(attrib.normals[3 * index.normal_index + 1]);
-                vertices.push_back(attrib.normals[3 * index.normal_index + 2]);
-            } else { vertices.push_back(0.0f); vertices.push_back(1.0f); vertices.push_back(0.0f); }
-        }
-    }
-
-    obj.vertexCount = vertices.size() / 8;
-    glGenVertexArrays(1, &obj.VAO);
-    glGenBuffers(1, &obj.VBO);
-    glBindVertexArray(obj.VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, obj.VBO);
-    glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
-
-    // Set attributes (Pos:0, Tex:1, Norm:2) - Same 8-float stride as map
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-
-    // Load Texture
-    glGenTextures(1, &obj.textureID);
-    glBindTexture(GL_TEXTURE_2D, obj.textureID);
-    sf::Image img;
-    if (img.loadFromFile(texPath)) {
-        img.flipVertically();
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.getSize().x, img.getSize().y, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.getPixelsPtr());
-        glGenerateMipmap(GL_TEXTURE_2D);
-    }
-}
-
-void Game::setupUI() {
-    sf::Vector2f winSize = static_cast<sf::Vector2f>(window.getSize());
-    float centerX = winSize.x * 0.5f;
-    float centerY = winSize.y * 0.5f;
-
-    // 1. Overlay
-    pauseOverlay.setSize(winSize);
-    pauseOverlay.setPosition({0.f, 0.f});
-    pauseOverlay.setFillColor(sf::Color(0, 0, 0, 180));
-
-    // 2. Pause Menu Box (Scales to 25% width, 60% height)
-    sf::Vector2f menuSize(winSize.x * 0.25f, winSize.y * 0.6f); 
-    pauseMenu.setSize(menuSize);
-    pauseMenu.setOrigin(menuSize * 0.5f);
-    pauseMenu.setPosition({centerX, centerY});
-    pauseMenu.setFillColor(sf::Color(40, 40, 40, 220));
-
-    // 3. Pause Title (Text size is 10% of window height)
-    pauseText.setString("PAUSED");
-    pauseText.setCharacterSize(static_cast<unsigned int>(winSize.y * 0.1f)); 
-    sf::FloatRect textBounds = pauseText.getLocalBounds();
-    pauseText.setOrigin({textBounds.position.x + textBounds.size.x / 2.f, 
-                        textBounds.position.y + textBounds.size.y / 2.f});
-    pauseText.setPosition({centerX, centerY - (menuSize.y * 0.35f)});
-
-    // 4. Buttons (Scales: 15% width, 6% height of window)
-    sf::Vector2f buttonSize(winSize.x * 0.15f, winSize.y * 0.06f);
-    
-    resumeBtn.setSize(buttonSize);
-    resumeBtn.setOrigin(buttonSize * 0.5f);
-    resumeBtn.setPosition({centerX, centerY - (menuSize.y * 0.05f)});
-    resumeBtn.setFillColor(sf::Color(0, 0, 0, 180));
-    
-    exitBtn.setSize(buttonSize);
-    exitBtn.setOrigin(buttonSize * 0.5f);
-    exitBtn.setPosition({centerX, centerY + (menuSize.y * 0.1f)});
-    exitBtn.setFillColor(sf::Color(0, 0, 0, 180));
-
-    // 5. Scalable Lambda
-    auto centerTextInButton = [&](sf::Text& txt, sf::RectangleShape& btn, std::string str) {
-        txt.setString(str);
-        // Text size is roughly 60% of button height
-        txt.setCharacterSize(static_cast<unsigned int>(btn.getSize().y * 0.6f));
-        txt.setFillColor(sf::Color::White);
-
-        sf::FloatRect b = txt.getLocalBounds();
-        txt.setOrigin({b.position.x + b.size.x / 2.f, b.position.y + b.size.y / 2.f});
-        txt.setPosition(btn.getPosition()); 
-    };
-
-    centerTextInButton(resumeText, resumeBtn, "RESUME");
-    centerTextInButton(exitText, exitBtn, "EXIT");
-
-    // 6. Sensitivity Slider (Scales: 15% width, 0.5% height)
-    sf::Vector2f trackSize(winSize.x * 0.15f, winSize.y * 0.005f); 
-    sensitivityTrack.setSize(trackSize);
-    sensitivityTrack.setOrigin({trackSize.x / 2.f, trackSize.y / 2.f}); 
-    // Positioned relative to the menu box bottom
-    sensitivityTrack.setPosition({centerX, centerY + (menuSize.y * 0.3f)});
-
-    sf::Vector2f handleSize(winSize.x * 0.01f, winSize.y * 0.03f);
-    sensitivityHandle.setSize(handleSize);
-    sensitivityHandle.setOrigin(handleSize * 0.5f);
-
-    float minSens = 0.01f;
-    float maxSens = 0.2f;
-    float t = (sensitivity - minSens) / (maxSens - minSens);
-    float trackLeft = sensitivityTrack.getPosition().x - (trackSize.x / 2.f);
-    float handleX = trackLeft + (t * trackSize.x);
-    sensitivityHandle.setPosition({handleX, sensitivityTrack.getPosition().y});
-
-    // 7. Sensitivity Text (Scales with window height)
-    sensitivityText.setString("MOUSE SENSITIVITY");
-    sensitivityText.setCharacterSize(static_cast<unsigned int>(winSize.y * 0.025f));
-    sensitivityText.setFillColor(sf::Color::White);
-    
-    sf::FloatRect sBounds = sensitivityText.getLocalBounds();
-    sensitivityText.setOrigin({sBounds.position.x + sBounds.size.x / 2.f, 
-                               sBounds.position.y + sBounds.size.y / 2.f});
-    sensitivityText.setPosition({centerX, sensitivityTrack.getPosition().y - (winSize.y * 0.04f)});
 }
 
 Game::~Game() {
-    glDeleteVertexArrays(1, &VAO);
-    glDeleteBuffers(1, &VBO);
-    glDeleteProgram(shaderProgram);
+    UnloadModel(mapModel);
+    UnloadTexture(grassTexture);
+    UnloadTexture(rockTexture);
+    
+    // Unload everything in your sceneObjects list if they aren't using the templates
+    // But since they use shared models, just unload the main templates you loaded
+    CloseWindow();
 }

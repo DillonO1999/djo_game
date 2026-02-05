@@ -1,10 +1,8 @@
-#ifndef GAME_HPP
-#define GAME_HPP
+#pragma once
 
-#include <glad/glad.h>
-#include <SFML/Window.hpp>
-#include <SFML/Graphics.hpp>
-#include "Camera.hpp"
+#include "raylib.h"
+#include <vector>
+#include <string>
 
 enum class GameState {
     Playing,
@@ -14,106 +12,70 @@ enum class GameState {
 class Game {
     public:
         Game();
-        ~Game(); // Destructor to clean up GPU memory
+        ~Game(); 
         void run();
 
         struct GameObject {
-            unsigned int VAO, VBO;
-            int vertexCount;
-            unsigned int textureID;
+            Model model;        // Replaces VAO/VBO/vertexCount
+            Texture2D texture;  // Replaces textureID
             
-            glm::vec3 position;
-            glm::vec3 rotation; // in degrees
-            glm::vec3 scale;
-            glm::vec3 groundNormal = glm::vec3(0.0f, 1.0f, 0.0f);
-            glm::mat4 modelMatrix = glm::mat4(1.0f);
+            Vector3 position;
+            Vector3 rotation;   // Rotation in degrees (Euler)
+            Vector3 scale;
+            Vector3 groundNormal;
+            
             bool isTree = false;
 
-            GameObject() : VAO(0), VBO(0), vertexCount(0), textureID(0), 
-                        position(0.0f), rotation(0.0f), scale(1.0f) {}
-
-            glm::mat4 getModelMatrix() {
-                glm::mat4 model = glm::translate(glm::mat4(1.0f), position);
-
-                // Calculate Slope Alignment
-                glm::vec3 worldUp(0, 1, 0);
-                if (glm::length(groundNormal - worldUp) > 0.001f) {
-                    float angle = acos(glm::dot(worldUp, groundNormal));
-                    glm::vec3 axis = glm::normalize(glm::cross(worldUp, groundNormal));
-                    model = glm::rotate(model, angle, axis);
-                }
-
-                // Apply the local Y-rotation (turning the fence)
-                model = glm::rotate(model, glm::radians(rotation.y), worldUp);
-                model = glm::scale(model, scale);
-                
-                return model;
-            }
+            // Note: Raylib handles matrix math internally during DrawModelEx,
+            // so we don't need a complex getModelMatrix() anymore!
         };
 
-        void loadObject(GameObject& obj, const std::string& path, const std::string& texPath);
-        void insertObject(GameObject& object, std::string object_file, std::string texture, glm::vec2 loc, glm::vec3 rot, glm::vec3 scale);
+        bool isCreativeMode = false;
 
-        bool isCreativeMode = false; // Toggle this with a key
+    private:   
+        // Physics variables (the ones you just fixed)
+        bool isCrouching = false;
+        bool isSprinting = false;
+        bool isGrounded = false;
+        float verticalVelocity = 0.0f;
+        float speedMultiplier = 1.0f;
+        float currentEyeHeight = 1.5f;
 
-        // ADD THESE LINES:
-        GameObject GrassTemplate;      // This stores the mesh and texture info
-        unsigned int numGrassInstances; // This stores how many to draw
-        unsigned int grassInstanceVBO;  // This stores the buffer ID for the positions
-
-    private:
-        void processEvents(float deltaTime);
-        void setupResources();
-        unsigned int compileShader(unsigned int type, const char* source);
-
-        sf::RenderWindow window; // We use sf::Window instead of RenderWindow for pure OpenGL
-        unsigned int VAO, VBO, shaderProgram;
-
-        Camera camera;
-        sf::Vector2i lastMousePos;
-        bool firstMouse = true;
-
-        sf::Vector2i windowCenter;
-        bool isPaused = false;
-
-        GameState currentState = GameState::Playing;
-    
-        // SFML UI elements
-        sf::RectangleShape pauseOverlay;
-        sf::RectangleShape pauseMenu;
-        sf::Font font;
-        sf::Text pauseText;
-        sf::RectangleShape resumeBtn;
-        sf::Text resumeText;
-        sf::RectangleShape exitBtn;
-        sf::Text exitText;
-        sf::Text sensitivityText;
-
-
-        unsigned int textureID;
+        // View variables
+        float cameraYaw = -90.0f;
+        float cameraPitch = 0.0f;
 
         float sensitivity = 0.1f;
-        sf::RectangleShape sensitivityTrack;
-        sf::RectangleShape sensitivityHandle;
         bool draggingSlider = false;
+        float sliderValue = 0.2f; // 0.0 to 1.0
 
-        std::vector<float> mapVertices;
-        unsigned int mapVAO, mapVBO;
-
-        unsigned int grassTextureID;
-        unsigned int rockTextureID;
-        // Keep your old textureID if you still need it, or replace it.
-
+        void processEvents(float deltaTime);
+        void setupResources();
         void setupUI();
-        void loadMap(const std::string& path);
+        
+        // Logic Helpers
+        void loadObject(GameObject& obj, const std::string& path, const std::string& texPath);
         float getMapHeightAt(float x, float z);
-        glm::vec3 getMapNormalAt(float x, float z);
+        Vector3 getMapNormalAt(float x, float z);
 
+        // Raylib Window & Camera
+        Camera3D camera;        // Replaces your custom Camera class
+        GameState currentState;
+
+        Rectangle pauseMenuRect, resumeBtnRect, exitBtnRect, sliderTrackRect, sliderHandleRect;
+
+        // Raylib doesn't need "Shape" objects stored as variables for UI.
+        // We usually define UI sizes and draw them immediately in run().
+        // However, we can keep some variables for slider logic:
+        
+
+        // Assets
+        Model mapModel;         // The main terrain
+        Texture2D grassTexture;
+        Texture2D rockTexture;
         
         std::vector<GameObject> sceneObjects;
-
-        // Inside Game class members
-        unsigned int objectShaderProgram;
+        
+        // For Custom Terrain Shading (Slope Blending)
+        Shader terrainShader;
 };
-
-#endif
