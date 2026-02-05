@@ -45,9 +45,9 @@ class Game {
         float cameraYaw = -90.0f;
         float cameraPitch = 0.0f;
 
-        float sensitivity = 0.1f;
+        float sliderValue = 0.25f; // Visual 0.0 to 1.0
+        float sensitivity = 0.0575f; // Math value (mapped from 0.25)
         bool draggingSlider = false;
-        float sliderValue = 0.2f; // 0.0 to 1.0
 
         void processEvents(float deltaTime);
         void setupResources();

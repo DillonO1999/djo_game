@@ -67,10 +67,14 @@ void Game::setupUI() {
 
     // 4. Slider Handle
     Vector2 handleSize = { sw * 0.01f, sh * 0.03f };
-    float t = (sensitivity - 0.01f) / (0.2f - 0.01f); // Calculate normalized position
-    sliderHandleRect = { sliderTrackRect.x + (t * trackSize.x) - handleSize.x/2, 
-                         sliderTrackRect.y + trackSize.y/2 - handleSize.y/2, 
-                         handleSize.x, handleSize.y };
+    
+    // Use the CENTER of the track Y for the handle Y
+    sliderHandleRect = { 
+        sliderTrackRect.x + (sliderValue * sliderTrackRect.width) - handleSize.x/2, 
+        sliderTrackRect.y + (sliderTrackRect.height / 2.0f) - (handleSize.y / 2.0f), 
+        handleSize.x, 
+        handleSize.y 
+    };
 }
 
 // Load in map, models and textures
@@ -226,17 +230,20 @@ void Game::processEvents(float deltaTime) {
         // --- 4. MOVEMENT & COLLISION PREP ---
         Vector3 nextPos = camera.position;
 
-        // Calculate the true direction vector
+        // Calculate the true direction vector (where the eyes are looking)
         Vector3 lookDir = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
         Vector3 forward = lookDir;
 
+        // ONLY lock to the horizontal plane if we are walking
         if (!isCreativeMode) {
-            forward.y = 0; // Lock to ground for walking
+            forward.y = 0; 
             forward = Vector3Normalize(forward);
         }
+        // In Creative Mode, forward.y remains intact, allowing vertical flight!
 
         Vector3 right = Vector3CrossProduct(forward, camera.up);
 
+        // Apply movement to nextPos
         if (IsKeyDown(KEY_W)) nextPos = Vector3Add(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
         if (IsKeyDown(KEY_S)) nextPos = Vector3Subtract(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
         if (IsKeyDown(KEY_A)) nextPos = Vector3Subtract(camera.position, Vector3Scale(right, currentSpeed * deltaTime));
@@ -251,59 +258,79 @@ void Game::processEvents(float deltaTime) {
         if (nextPos.z < -mapLimit) nextPos.z = -mapLimit;
 
         // 3. Finally, apply the safe position
-        camera.position = nextPos;
+        camera.position.x = nextPos.x;
+        camera.position.z = nextPos.z;
+
+        // NEW: If we are in creative mode, movement keys/look should affect height too!
+        if (isCreativeMode) {
+            camera.position.y = nextPos.y;
+        }
 
         // --- 5. PHYSICS & SLOPES ---
         float terrainHeight = getMapHeightAt(camera.position.x, camera.position.z);
         Vector3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
 
         float targetEyeHeight = isCrouching ? 0.8f : 1.5f;
+
+        // 1. Height Correction (The "Secret Sauce")
+        float oldEyeHeight = currentEyeHeight;
         currentEyeHeight = Lerp(currentEyeHeight, targetEyeHeight, 12.0f * deltaTime);
+        float frameHeightChange = currentEyeHeight - oldEyeHeight;
+        camera.position.y += frameHeightChange;
+
         float floorY = terrainHeight + currentEyeHeight;
 
-        // SNAP LOGIC: If we are very close to the floor, just snap to it
-        float snapDistance = 0.5f; 
-
         if (!isCreativeMode) {
-            // Gravity logic
-            if (!isGrounded) verticalVelocity -= 15.0f * deltaTime;
+            // 2. Gravity Logic: Only pull down if we aren't "grounded"
+            if (!isGrounded) {
+                verticalVelocity -= 18.0f * deltaTime; // Gravity strength
+            }
+            
             camera.position.y += verticalVelocity * deltaTime;
 
-            // Inside processEvents, under the !isCreativeMode branch:
+            // 3. Jump Logic: Only allow if on the ground
             if (IsKeyPressed(KEY_SPACE) && isGrounded) {
-                verticalVelocity = 7.0f;
-                isGrounded = false; // This tells the physics "we are in the air now"
+                verticalVelocity = 8.0f; // Jump force
+                isGrounded = false;
             }
 
-            // Check collision
-            const float slopeLimit = 0.6f;
-            
-            // Improved check: If below floor OR very close to it while not jumping
-            if (camera.position.y <= floorY + snapDistance && verticalVelocity <= 0) {
+            // 4. Ground Snapping & Collision
+            const float slopeLimit = 0.65f; // Steeper than this = slide
+            const float snapDistance = 0.25f; // How close to floor before we stick
+
+            // If we are moving down (or standing) and are at or below the "floor zone"
+            if (verticalVelocity <= 0 && camera.position.y <= floorY + snapDistance) {
+                
                 if (groundNormal.y >= slopeLimit) {
-                    camera.position.y = floorY; // SNAP to ground
+                    // Safe Ground: Stick the player to the terrain
+                    camera.position.y = floorY; 
                     verticalVelocity = 0.0f;
                     isGrounded = true;
                 } else {
-                    // Slide logic for steep slopes
+                    // Too Steep: Slide off the slope
                     isGrounded = false;
-                    Vector3 slideDir = Vector3Scale(Vector3{groundNormal.x, 0, groundNormal.z}, 15.0f * deltaTime);
-                    camera.position = Vector3Add(camera.position, slideDir);
-                    camera.position.y = floorY + 0.05f;
+                    // Calculate a slide vector based on the ground normal
+                    Vector3 slideDir = { groundNormal.x, 0, groundNormal.z };
+                    camera.position = Vector3Add(camera.position, Vector3Scale(slideDir, 10.0f * deltaTime));
+                    
+                    // Keep the player just slightly above the slope so they don't jitter
+                    if (camera.position.y < floorY) camera.position.y = floorY + 0.05f;
                 }
             } else {
+                // We are actually in the air (jumping or falling off a cliff)
                 isGrounded = false;
             }
-        } else if (isCreativeMode) {
-            // 2. Manual height control (Space/Ctrl)
+        } 
+        else {
+            // Creative Mode: Elevator keys still work for precision
             if (IsKeyDown(KEY_SPACE)) camera.position.y += currentSpeed * deltaTime;
             if (IsKeyDown(KEY_LEFT_CONTROL)) camera.position.y -= currentSpeed * deltaTime;
-
-            // 3. THE FIX: Ground Clamp
-            // This prevents flying through the floor while in Creative Mode
-            if (camera.position.y < floorY) {
-                camera.position.y = floorY;
-            }
+            
+            // Safety Floor Clamp: prevents flying through the map
+            if (camera.position.y < floorY) camera.position.y = floorY;
+            
+            isGrounded = true; 
+            verticalVelocity = 0.0f; // Reset gravity speed so you don't fall when switching back
         }
 
         // --- 6. MOUSE LOOK (MANUAL VERSION) ---
@@ -361,9 +388,13 @@ void Game::processEvents(float deltaTime) {
         if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) draggingSlider = false;
 
         if (draggingSlider) {
-            float mouseX = Clamp(mousePos.x, sliderTrackRect.x, sliderTrackRect.x + sliderTrackRect.width);
-            float t = (mouseX - sliderTrackRect.x) / sliderTrackRect.width;
-            sensitivity = Lerp(0.01f, 0.2f, t);
+            float mouseX = Clamp(GetMousePosition().x, sliderTrackRect.x, sliderTrackRect.x + sliderTrackRect.width);
+            
+            // 1. Calculate visual 0.0 to 1.0
+            sliderValue = (mouseX - sliderTrackRect.x) / sliderTrackRect.width;
+            
+            // 2. Map that to the math sensitivity (0.01 to 0.2)
+            sensitivity = Lerp(0.01f, 0.2f, sliderValue);
         }
     }
 }
@@ -444,13 +475,24 @@ void Game::run() {
                 DrawText("EXIT", exitBtnRect.x + (exitBtnRect.width/2 - MeasureText("EXIT", labelSize)/2), 
                         exitBtnRect.y + (exitBtnRect.height/2 - labelSize/2), labelSize, WHITE);
 
-                // 6. Sensitivity Slider
-                DrawRectangleRec(sliderTrackRect, GRAY);
-                
-                // Update handle position based on live sensitivity
-                float t = (sensitivity - 0.01f) / (0.2f - 0.01f);
-                sliderHandleRect.x = sliderTrackRect.x + (t * sliderTrackRect.width) - sliderHandleRect.width/2;
-                DrawRectangleRec(sliderHandleRect, WHITE);
+
+                // 1. Update handle position based on sliderValue
+                sliderHandleRect.x = sliderTrackRect.x + (sliderValue * sliderTrackRect.width) - (sliderHandleRect.width / 2.0f);
+                sliderHandleRect.y = sliderTrackRect.y + (sliderTrackRect.height / 2.0f) - (sliderHandleRect.height / 2.0f);
+
+                // 2. Draw Track and Handle
+                DrawRectangleRec(sliderTrackRect, GRAY); 
+                DrawRectangleRec(sliderHandleRect, WHITE); 
+
+                // 3. Draw "MOUSE SENSITIVITY" Header
+                DrawText("MOUSE SENSITIVITY", sw/2 - MeasureText("MOUSE SENSITIVITY", 20)/2, 
+                        sliderTrackRect.y - 40, 20, WHITE);
+
+                // 4. Draw the Value BELOW the slider
+                // We show the sliderValue (0.00 to 1.00) here
+                const char* sensText = TextFormat("Value: %.2f", sliderValue);
+                int sensTextWidth = MeasureText(sensText, 20);
+                DrawText(sensText, sw/2 - sensTextWidth/2, sliderTrackRect.y + 25, 20, WHITE);
 
                 DrawText("MOUSE SENSITIVITY", sw/2 - MeasureText("MOUSE SENSITIVITY", 20)/2, 
                         sliderTrackRect.y - 40, 20, WHITE);
