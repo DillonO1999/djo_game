@@ -78,4 +78,15 @@ class Game {
         
         // For Custom Terrain Shading (Slope Blending)
         Shader terrainShader;
+
+        // Inside Game.hpp, under private:
+        struct Ball {
+            Vector3 position;
+            Vector3 velocity;
+            float radius;
+            float restitution; // Bounciness (0.0 to 1.0)
+        } gameBall;
+
+        // Add this helper method
+        void updateBall(float deltaTime);
 };

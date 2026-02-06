@@ -5,13 +5,17 @@
 #include <algorithm>
 
 Game::Game() {
-    InitWindow(1500, 1000, "Real 3D - Raylib Version");
+    // 1. Set the configuration flags BEFORE InitWindow
+    SetConfigFlags(FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
+    
+    // 2. Initialize with 0, 0 to use the current monitor resolution
+    InitWindow(0, 0, "Real 3D - Raylib Version");
     SetTargetFPS(60);
     DisableCursor();
     SetExitKey(KEY_NULL);
 
     // Ensure the camera isn't looking at itself
-    camera.position = (Vector3){ 400.0f, 50.0f, 400.0f };
+    camera.position = (Vector3){ 490.0f, 50.0f, 490.0f };
     camera.target   = (Vector3){ 0.0f, 0.0f, 0.0f };
     camera.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
     camera.fovy     = 60.0f;
@@ -43,6 +47,41 @@ Vector3 Game::getMapNormalAt(float x, float z) {
     RayCollision hit = GetRayCollisionMesh(ray, mapModel.meshes[0], mapModel.transform);
     
     return (hit.hit) ? hit.normal : (Vector3){ 0, 1, 0 };
+}
+
+void Game::updateBall(float deltaTime) {
+    // 1. Apply Gravity
+    gameBall.velocity.y -= 15.0f * deltaTime;
+
+    // 2. Air Friction (Damping) - Slows it down over time
+    gameBall.velocity = Vector3Scale(gameBall.velocity, 0.995f);
+
+    // 3. Update Position
+    gameBall.position = Vector3Add(gameBall.position, Vector3Scale(gameBall.velocity, deltaTime));
+
+    // 4. Ground Collision
+    float terrainHeight = getMapHeightAt(gameBall.position.x, gameBall.position.z);
+    if (gameBall.position.y - gameBall.radius < terrainHeight) {
+        gameBall.position.y = terrainHeight + gameBall.radius;
+        
+        // Reflect velocity based on ground normal for realistic bounces
+        Vector3 normal = getMapNormalAt(gameBall.position.x, gameBall.position.z);
+        gameBall.velocity = Vector3Reflect(gameBall.velocity, normal);
+        
+        // Apply bounciness
+        gameBall.velocity = Vector3Scale(gameBall.velocity, gameBall.restitution);
+    }
+
+    // 5. Wall Collisions (Boundary 500x500)
+    const float limit = 495.0f;
+    if (fabs(gameBall.position.x) > limit) {
+        gameBall.velocity.x *= -gameBall.restitution;
+        gameBall.position.x = (gameBall.position.x > 0) ? limit : -limit;
+    }
+    if (fabs(gameBall.position.z) > limit) {
+        gameBall.velocity.z *= -gameBall.restitution;
+        gameBall.position.z = (gameBall.position.z > 0) ? limit : -limit;
+    }
 }
 
 // Pause Menu setup
@@ -103,6 +142,12 @@ void Game::setupResources() {
     // Tell the shader that sampler2D 'texture1' corresponds to texture slot 1
     int secondSlot = 1;
     SetShaderValue(terrainShader, texRockLoc, &secondSlot, SHADER_UNIFORM_INT);
+
+    // Load Ball
+    gameBall.position = (Vector3){ 480.0f, 300.0f, 480.0f }; // Start in the air
+    gameBall.velocity = (Vector3){ 0.0f, 0.0f, 0.0f };
+    gameBall.radius = 1.0f;
+    gameBall.restitution = 0.8f; // Bounces back with 80% energy
 
     // 2. Load Templates
     Model fenceModel = LoadModel("assets/objects/Farm Buildings - Sept 2018/OBJ/Fence.obj");
@@ -266,6 +311,16 @@ void Game::processEvents(float deltaTime) {
             camera.position.y = nextPos.y;
         }
 
+        // Inside Game::processEvents, under your player movement logic:
+        float dist = Vector3Distance(camera.position, gameBall.position);
+        if (dist < gameBall.radius + 1.5f) { // 1.5 is player's rough collision size
+            Vector3 pushDir = Vector3Normalize(Vector3Subtract(gameBall.position, camera.position));
+            float kickForce = Vector3Length(Vector3Subtract(camera.position, nextPos)) * 100.0f; 
+            
+            // Add velocity to the ball based on player movement
+            gameBall.velocity = Vector3Add(gameBall.velocity, Vector3Scale(pushDir, kickForce + 5.0f));
+        }
+
         // --- 5. PHYSICS & SLOPES ---
         float terrainHeight = getMapHeightAt(camera.position.x, camera.position.z);
         Vector3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
@@ -406,6 +461,7 @@ void Game::run() {
         
         // Update logic
         processEvents(deltaTime);
+        updateBall(deltaTime);
 
         BeginDrawing();
             ClearBackground(SKYBLUE);
@@ -413,6 +469,15 @@ void Game::run() {
             BeginMode3D(camera);
                 // Draw the Map
                 DrawModel(mapModel, {0,0,0}, 1.0f, WHITE);
+
+                // 1. The Core (Brightest part)
+                DrawSphere(gameBall.position, gameBall.radius, ORANGE);
+
+                // // 2. The Glow (Slightly larger, semi-transparent)
+                // DrawSphere(gameBall.position, gameBall.radius * 1.1f, Fade(LIME, 0.3f));
+
+                // 3. The Detail Lines
+                DrawSphereWires(gameBall.position, gameBall.radius + 0.1, 10, 10, BLACK);
 
                 // Draw all objects with their specific rotation and scale
                 for (auto& obj : sceneObjects) {
@@ -486,16 +551,13 @@ void Game::run() {
 
                 // 3. Draw "MOUSE SENSITIVITY" Header
                 DrawText("MOUSE SENSITIVITY", sw/2 - MeasureText("MOUSE SENSITIVITY", 20)/2, 
-                        sliderTrackRect.y - 40, 20, WHITE);
+                        sliderTrackRect.y - pauseMenuRect.height * 0.05, 20, WHITE);
 
                 // 4. Draw the Value BELOW the slider
                 // We show the sliderValue (0.00 to 1.00) here
                 const char* sensText = TextFormat("Value: %.2f", sliderValue);
                 int sensTextWidth = MeasureText(sensText, 20);
-                DrawText(sensText, sw/2 - sensTextWidth/2, sliderTrackRect.y + 25, 20, WHITE);
-
-                DrawText("MOUSE SENSITIVITY", sw/2 - MeasureText("MOUSE SENSITIVITY", 20)/2, 
-                        sliderTrackRect.y - 40, 20, WHITE);
+                DrawText(sensText, sw/2 - sensTextWidth/2, sliderTrackRect.y + pauseMenuRect.height * 0.04, 20, WHITE);
             }
 
         EndDrawing();
