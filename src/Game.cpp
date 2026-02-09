@@ -1,32 +1,38 @@
 #include "Game.hpp"
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 #include <vector>
 #include <algorithm>
 
 Game::Game() {
-    // 1. Set the configuration flags BEFORE InitWindow
     SetConfigFlags(FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT | FLAG_MSAA_4X_HINT);
-    
-    // 2. Initialize with 0, 0 to use the current monitor resolution
     InitWindow(0, 0, "Real 3D - Raylib Version");
     SetTargetFPS(60);
     DisableCursor();
     SetExitKey(KEY_NULL);
 
-    // Ensure the camera isn't looking at itself
-    camera.position = (Vector3){ 490.0f, 50.0f, 490.0f };
-    camera.target   = (Vector3){ 0.0f, 0.0f, 0.0f };
-    camera.up       = (Vector3){ 0.0f, 1.0f, 0.0f };
-    camera.fovy     = 60.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
+    playerPos = (Vector3){ 490.0f, 50.0f, 490.0f }; // Start high up
+    cameraYaw = 225.0f;
+    cameraPitch = -20.0f; // Look slightly down
 
-    // Reset your manual yaw/pitch to match this look direction
-    cameraYaw = -135.0f; 
-    cameraPitch = -15.0f;
+    vehiclePos = (Vector3){ 490.0f, 50.0f, 490.0f };
 
-    setupUI(); 
+    // Initialize Ball data so updateBall doesn't crash on frame 1
+    gameBall.velocity = {0,0,0};
+    gameBall.radius = 1.0f;
+
+    // Add these inside Game::Game()
+    camera.up = (Vector3){ 0.0f, 1.0f, 0.0f };    // Camera up vector (usually Z or Y)
+    camera.fovy = 60.0f;                          // Camera field-of-view aperture
+    camera.projection = CAMERA_PERSPECTIVE;      // Camera projection type
+
     setupResources();
+    setupUI();
+    
+    // Now snap player to ground after map is loaded in setupResources
+    playerPos.y = getMapHeightAt(playerPos.x, playerPos.z);
+    
     currentState = GameState::Playing;
 }
 
@@ -143,10 +149,35 @@ void Game::setupResources() {
     int secondSlot = 1;
     SetShaderValue(terrainShader, texRockLoc, &secondSlot, SHADER_UNIFORM_INT);
 
+    // Load player
+    playerModel = LoadModel("assets/characters/sci_fi_soldier_light_infantry_low_poly_character.glb");
+    // 2. Load the animations from the SAME FBX
+    // Load the animations
+    playerAnims = LoadModelAnimations("assets/characters/sci_fi_soldier_light_infantry_low_poly_character.glb", &animsCount);
+
+    // Inside setupResources()
+    for (int i = 0; i < playerModel.materialCount; i++) {
+        // This resets the material to the standard raylib internal shader
+        playerModel.materials[i].shader = mapModel.materials[0].shader; 
+        // OR simply:
+        // playerModel.materials[i].shader = LoadShader(0, 0); 
+        
+        playerModel.materials[i].maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+    }
+
+    // CRITICAL SAFETY CHECK
+    if (playerAnims == nullptr) {
+        TraceLog(LOG_ERROR, "ANIMATION FILE NOT FOUND! Check your path.");
+        animsCount = 0; // Ensure the loop in run() doesn't execute
+    }
+
+    vehicleModel = LoadModel("assets/vehicles/spaceship.glb");
+
+
     // Load Ball
-    gameBall.position = (Vector3){ 480.0f, 300.0f, 480.0f }; // Start in the air
+    gameBall.position = (Vector3){ 0.0f, 300.0f, 0.0f }; // Start in the air
     gameBall.velocity = (Vector3){ 0.0f, 0.0f, 0.0f };
-    gameBall.radius = 1.0f;
+    gameBall.radius = 2.0f;
     gameBall.restitution = 0.8f; // Bounces back with 80% energy
 
     // 2. Load Templates
@@ -241,19 +272,24 @@ void Game::setupResources() {
 
 // Process key presses and events
 void Game::processEvents(float deltaTime) {
-    // --- 1. GLOBAL INPUTS (Always active) ---
     if (IsKeyPressed(KEY_ESCAPE)) {
         if (currentState == GameState::Playing) {
             currentState = GameState::Paused;
-            EnableCursor(); // Show mouse
+            EnableCursor();
         } else {
             currentState = GameState::Playing;
-            DisableCursor(); // Hide mouse
+            DisableCursor();
         }
     }
 
     if (currentState == GameState::Playing) {
-        // --- 2. TOGGLES ---
+        // 1. MOUSE LOOK
+        Vector2 mouseDelta = GetMouseDelta();
+        cameraYaw   -= (mouseDelta.x * sensitivity);
+        cameraPitch -= (mouseDelta.y * sensitivity);
+        cameraPitch = Clamp(cameraPitch, -89.0f, 89.0f);
+
+        // 2. TOGGLES
         if (IsKeyPressed(KEY_C)) isCrouching = !isCrouching;
         if (IsKeyPressed(KEY_LEFT_SHIFT)) isSprinting = !isSprinting;
         if (IsKeyPressed(KEY_G)) {
@@ -261,165 +297,148 @@ void Game::processEvents(float deltaTime) {
             verticalVelocity = 0.0f;
         }
 
-        // --- 3. DYNAMIC SPEED ---
+        // 3. BASE CALCULATIONS
+        float floorY = getMapHeightAt(playerPos.x, playerPos.z);
         float baseSpeed = isCreativeMode ? 90.0f : 7.0f;
-        float targetMult = 1.0f;
-        // And this:
-        if (isSprinting) targetMult = 1.7f;
-        if (isCrouching) targetMult = 0.4f;
-
-        // Lerp speed multiplier
+        float targetMult = (isSprinting) ? 1.7f : (isCrouching ? 0.4f : 1.0f);
         speedMultiplier = Lerp(speedMultiplier, targetMult, 12.0f * deltaTime);
         float currentSpeed = baseSpeed * speedMultiplier;
 
-        // --- 4. MOVEMENT & COLLISION PREP ---
-        Vector3 nextPos = camera.position;
+        // Direction Vectors
+        Vector3 forward2D = { sinf(cameraYaw * DEG2RAD), 0, cosf(cameraYaw * DEG2RAD) };
+        Vector3 right = { cosf(cameraYaw * DEG2RAD), 0, -sinf(cameraYaw * DEG2RAD) };
+        Vector3 forward3D = { 
+            sinf(cameraYaw * DEG2RAD) * cosf(cameraPitch * DEG2RAD), 
+            sinf(cameraPitch * DEG2RAD), 
+            cosf(cameraYaw * DEG2RAD) * cosf(cameraPitch * DEG2RAD) 
+        };
 
-        // Calculate the true direction vector (where the eyes are looking)
-        Vector3 lookDir = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
-        Vector3 forward = lookDir;
+        Vector3 moveStep = { 0, 0, 0 };
 
-        // ONLY lock to the horizontal plane if we are walking
-        if (!isCreativeMode) {
-            forward.y = 0; 
-            forward = Vector3Normalize(forward);
-        }
-        // In Creative Mode, forward.y remains intact, allowing vertical flight!
-
-        Vector3 right = Vector3CrossProduct(forward, camera.up);
-
-        // Apply movement to nextPos
-        if (IsKeyDown(KEY_W)) nextPos = Vector3Add(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
-        if (IsKeyDown(KEY_S)) nextPos = Vector3Subtract(camera.position, Vector3Scale(forward, currentSpeed * deltaTime));
-        if (IsKeyDown(KEY_A)) nextPos = Vector3Subtract(camera.position, Vector3Scale(right, currentSpeed * deltaTime));
-        if (IsKeyDown(KEY_D)) nextPos = Vector3Add(camera.position, Vector3Scale(right, currentSpeed * deltaTime));
-
-        // 2. Smooth Boundary Check (Slide along the wall)
-        const float mapLimit = 497.5f; // Stay slightly inside the actual 500 edge
-
-        if (nextPos.x > mapLimit)  nextPos.x = mapLimit;
-        if (nextPos.x < -mapLimit) nextPos.x = -mapLimit;
-        if (nextPos.z > mapLimit)  nextPos.z = mapLimit;
-        if (nextPos.z < -mapLimit) nextPos.z = -mapLimit;
-
-        // 3. Finally, apply the safe position
-        camera.position.x = nextPos.x;
-        camera.position.z = nextPos.z;
-
-        // NEW: If we are in creative mode, movement keys/look should affect height too!
+        // 4. MOVEMENT & PHYSICS BRANCHING
         if (isCreativeMode) {
-            camera.position.y = nextPos.y;
-        }
+            // --- CREATIVE FLYING MODE ---
+            if (IsKeyDown(KEY_W)) moveStep = Vector3Add(moveStep, forward3D);
+            if (IsKeyDown(KEY_S)) moveStep = Vector3Subtract(moveStep, forward3D);
+            if (IsKeyDown(KEY_A)) moveStep = Vector3Add(moveStep, right);
+            if (IsKeyDown(KEY_D)) moveStep = Vector3Subtract(moveStep, right);
 
-        // Inside Game::processEvents, under your player movement logic:
-        float dist = Vector3Distance(camera.position, gameBall.position);
-        if (dist < gameBall.radius + 1.5f) { // 1.5 is player's rough collision size
-            Vector3 pushDir = Vector3Normalize(Vector3Subtract(gameBall.position, camera.position));
-            float kickForce = Vector3Length(Vector3Subtract(camera.position, nextPos)) * 100.0f; 
-            
-            // Add velocity to the ball based on player movement
-            gameBall.velocity = Vector3Add(gameBall.velocity, Vector3Scale(pushDir, kickForce + 5.0f));
-        }
+            if (Vector3Length(moveStep) > 0) {
+                moveStep = Vector3Normalize(moveStep);
+                Vector3 displacement = Vector3Scale(moveStep, currentSpeed * deltaTime);
+                
+                playerPos.x += displacement.x;
+                playerPos.z += displacement.z;
 
-        // --- 5. PHYSICS & SLOPES ---
-        float terrainHeight = getMapHeightAt(camera.position.x, camera.position.z);
-        Vector3 groundNormal = getMapNormalAt(camera.position.x, camera.position.z);
-
-        float targetEyeHeight = isCrouching ? 0.8f : 1.5f;
-
-        // 1. Height Correction (The "Secret Sauce")
-        float oldEyeHeight = currentEyeHeight;
-        currentEyeHeight = Lerp(currentEyeHeight, targetEyeHeight, 12.0f * deltaTime);
-        float frameHeightChange = currentEyeHeight - oldEyeHeight;
-        camera.position.y += frameHeightChange;
-
-        float floorY = terrainHeight + currentEyeHeight;
-
-        if (!isCreativeMode) {
-            // 2. Gravity Logic: Only pull down if we aren't "grounded"
-            if (!isGrounded) {
-                verticalVelocity -= 18.0f * deltaTime; // Gravity strength
+                // Move vertically based on mouse pitch, but block if hitting the floor
+                float potentialY = playerPos.y + displacement.y;
+                playerPos.y = (potentialY > floorY) ? potentialY : floorY + 0.01f;
             }
-            
-            camera.position.y += verticalVelocity * deltaTime;
 
-            // 3. Jump Logic: Only allow if on the ground
+            // Vertical Overrides
+            if (IsKeyDown(KEY_SPACE)) playerPos.y += currentSpeed * deltaTime;
+            if (IsKeyDown(KEY_LEFT_CONTROL)) {
+                playerPos.y -= currentSpeed * deltaTime;
+                if (playerPos.y < floorY) playerPos.y = floorY + 0.01f;
+            }
+
+            isGrounded = true;
+            verticalVelocity = 0.0f;
+        } 
+        else {
+            // --- STANDARD WALKING MODE ---
+            if (IsKeyDown(KEY_W)) moveStep = Vector3Add(moveStep, forward2D);
+            if (IsKeyDown(KEY_S)) moveStep = Vector3Subtract(moveStep, forward2D);
+            if (IsKeyDown(KEY_A)) moveStep = Vector3Add(moveStep, right);
+            if (IsKeyDown(KEY_D)) moveStep = Vector3Subtract(moveStep, right);
+
+            if (Vector3Length(moveStep) > 0) {
+                moveStep = Vector3Normalize(moveStep);
+                playerPos = Vector3Add(playerPos, Vector3Scale(moveStep, currentSpeed * deltaTime));
+            }
+
+            // Gravity & Jumping
+            if (!isGrounded) verticalVelocity -= 18.0f * deltaTime;
+            playerPos.y += verticalVelocity * deltaTime;
+
             if (IsKeyPressed(KEY_SPACE) && isGrounded) {
-                verticalVelocity = 8.0f; // Jump force
+                verticalVelocity = 8.0f;
                 isGrounded = false;
             }
 
-            // 4. Ground Snapping & Collision
-            const float slopeLimit = 0.65f; // Steeper than this = slide
-            const float snapDistance = 0.25f; // How close to floor before we stick
-
-            // If we are moving down (or standing) and are at or below the "floor zone"
-            if (verticalVelocity <= 0 && camera.position.y <= floorY + snapDistance) {
-                
-                if (groundNormal.y >= slopeLimit) {
-                    // Safe Ground: Stick the player to the terrain
-                    camera.position.y = floorY; 
+            // Snapping to Slopes
+            float snapDistance = 0.5f; 
+            if (verticalVelocity <= 0 && (playerPos.y - floorY) < snapDistance) {
+                if (getMapNormalAt(playerPos.x, playerPos.z).y >= 0.65f) {
+                    playerPos.y = Lerp(playerPos.y, floorY, 7.0f * deltaTime);
                     verticalVelocity = 0.0f;
                     isGrounded = true;
                 } else {
-                    // Too Steep: Slide off the slope
+                    // Slide down steep slopes
+                    Vector3 normal = getMapNormalAt(playerPos.x, playerPos.z);
+                    playerPos.x += normal.x * 10.0f * deltaTime;
+                    playerPos.z += normal.z * 10.0f * deltaTime;
                     isGrounded = false;
-                    // Calculate a slide vector based on the ground normal
-                    Vector3 slideDir = { groundNormal.x, 0, groundNormal.z };
-                    camera.position = Vector3Add(camera.position, Vector3Scale(slideDir, 10.0f * deltaTime));
-                    
-                    // Keep the player just slightly above the slope so they don't jitter
-                    if (camera.position.y < floorY) camera.position.y = floorY + 0.05f;
                 }
             } else {
-                // We are actually in the air (jumping or falling off a cliff)
                 isGrounded = false;
             }
-        } 
-        else {
-            // Creative Mode: Elevator keys still work for precision
-            if (IsKeyDown(KEY_SPACE)) camera.position.y += currentSpeed * deltaTime;
-            if (IsKeyDown(KEY_LEFT_CONTROL)) camera.position.y -= currentSpeed * deltaTime;
-            
-            // Safety Floor Clamp: prevents flying through the map
-            if (camera.position.y < floorY) camera.position.y = floorY;
-            
-            isGrounded = true; 
-            verticalVelocity = 0.0f; // Reset gravity speed so you don't fall when switching back
         }
 
-        // --- 6. MOUSE LOOK (MANUAL VERSION) ---
-        Vector2 mouseDelta = GetMouseDelta();
+        // --- 5. CAMERA & BOUNDARIES ---
+        // Map boundaries
+        const float mapLimit = 497.5f; 
+        playerPos.x = Clamp(playerPos.x, -mapLimit, mapLimit);
+        playerPos.z = Clamp(playerPos.z, -mapLimit, mapLimit);
 
-        // 1. Update your internal Yaw and Pitch (add these to your Game or Camera class)
-        // We use negative mouseDelta.y because screen coordinates are inverted
-        cameraYaw   += (mouseDelta.x * sensitivity);
-        cameraPitch -= (mouseDelta.y * sensitivity);
+        // Height Interpolation for Crouching
+        float targetEyeHeight = isCrouching ? 0.8f : 1.5f;
+        currentEyeHeight = Lerp(currentEyeHeight, targetEyeHeight, 12.0f * deltaTime);
 
-        // 2. Clamp Pitch to prevent the camera from flipping over (somewhat less than 90 degrees)
-        if (cameraPitch > 89.0f)  cameraPitch = 89.0f;
-        if (cameraPitch < -89.0f) cameraPitch = -89.0f;
+        // --- 6. THIRD PERSON CAMERA POSITIONING ---
+        float cameraDistance = 3.0f; 
 
-        // 3. Calculate the Direction Vector from Yaw/Pitch
-        // Standard 3D Cartesian conversion
-        Vector3 direction;
-        direction.x = cosf(DEG2RAD * cameraYaw) * cosf(DEG2RAD * cameraPitch);
-        direction.y = sinf(DEG2RAD * cameraPitch);
-        direction.z = sinf(DEG2RAD * cameraYaw) * cosf(DEG2RAD * cameraPitch);
+        // 1. CLAMP PITCH
+        cameraPitch = Clamp(cameraPitch, -80.0f, 70.0f); 
+        if (cameraPitch > 10.0f) {
+            cameraDistance *= 1 - cameraPitch / 70.0f;
+        }
 
-        // 4. Update the Camera Target
-        // The target is just the camera's position + the direction we are looking
-        camera.target = Vector3Add(camera.position, direction);
+        camera.target = (Vector3){ playerPos.x, playerPos.y + currentEyeHeight, playerPos.z };
 
-        // --- 7. TREE COLLISION ---
+        // 2. SPHERICAL MATH
+        float horizontalDist = cameraDistance * cosf(cameraPitch * DEG2RAD);
+        float verticalDist   = cameraDistance * sinf(cameraPitch * DEG2RAD);
+
+        camera.position.x = camera.target.x - sinf(cameraYaw * DEG2RAD) * horizontalDist;
+        camera.position.z = camera.target.z - cosf(cameraYaw * DEG2RAD) * horizontalDist;
+        camera.position.y = camera.target.y - verticalDist; 
+
+        // 3. FLOOR COLLISION - Only apply if NOT in creative mode
+        if (!isCreativeMode) {
+            float camFloor = getMapHeightAt(camera.position.x, camera.position.z) + 0.5f;
+            if (camera.position.y < camFloor) camera.position.y = camFloor;
+            
+            // Also ensure player doesn't dive into floor during movement
+            if (playerPos.y < floorY) playerPos.y = floorY + 0.01f;
+        }
+
+        // --- 7. BALL INTERACTION ---
+        float ballDist = Vector3Distance(playerPos, gameBall.position);
+        if (ballDist < gameBall.radius + 1.5f) {
+            Vector3 pushDir = Vector3Normalize(Vector3Subtract(gameBall.position, playerPos));
+            gameBall.velocity = Vector3Add(gameBall.velocity, Vector3Scale(pushDir, 10.0f));
+        }
+
+        // --- 8. TREE COLLISION ---
         for (auto& obj : sceneObjects) {
             if (obj.isTree) {
-                float dist = Vector2Distance({camera.position.x, camera.position.z}, {obj.position.x, obj.position.z});
+                float dist = Vector2Distance({playerPos.x, playerPos.z}, {obj.position.x, obj.position.z});
                 float radius = 2.0f * obj.scale.x / 10.0f;
                 if (dist < radius) {
-                    Vector2 push = Vector2Scale(Vector2Normalize(Vector2Subtract({camera.position.x, camera.position.z}, {obj.position.x, obj.position.z})), radius - dist);
-                    camera.position.x += push.x;
-                    camera.position.z += push.y;
+                    Vector2 push = Vector2Scale(Vector2Normalize(Vector2Subtract({playerPos.x, playerPos.z}, {obj.position.x, obj.position.z})), radius - dist);
+                    playerPos.x += push.x;
+                    playerPos.z += push.y;
                 }
             }
         }
@@ -463,6 +482,19 @@ void Game::run() {
         processEvents(deltaTime);
         updateBall(deltaTime);
 
+        // // Only update if playerAnims is NOT null and we have at least one animation
+        // if (playerAnims != nullptr && animsCount > 0) {
+        //     // Safety: Ensure we don't look for an index that doesn't exist
+        //     int validAnimIndex = (currentAnimIndex < animsCount) ? currentAnimIndex : 0;
+            
+        //     ModelAnimation anim = playerAnims[validAnimIndex];
+        //     animFrameCounter++;
+
+        //     UpdateModelAnimation(playerModel, anim, animFrameCounter);
+
+        //     if (animFrameCounter >= anim.frameCount) animFrameCounter = 0;
+        // }
+
         BeginDrawing();
             ClearBackground(SKYBLUE);
 
@@ -470,13 +502,29 @@ void Game::run() {
                 // Draw the Map
                 DrawModel(mapModel, {0,0,0}, 1.0f, WHITE);
 
+                float playerRotation = (cameraYaw); 
+
+                // 2. Draw the model
+                DrawModelEx(
+                    playerModel, 
+                    playerPos, 
+                    (Vector3){ 0, 1, 0 }, // Rotate around the Y axis
+                    playerRotation,       // This is the "steering" angle
+                    (Vector3){ 0.01f, 0.01f, 0.01f }, 
+                    WHITE
+                );
+
+                // DrawModelEx(
+                //     vehicleModel, 
+                //     playerPos, 
+                //     getMapNormalAt(playerPos.x, playerPos.z), // Rotate around the Y axis
+                //     playerRotation,       // This is the "steering" angle
+                //     (Vector3){ 0.5f, 0.5f, 0.5f }, 
+                //     WHITE
+                // );
+
                 // 1. The Core (Brightest part)
                 DrawSphere(gameBall.position, gameBall.radius, ORANGE);
-
-                // // 2. The Glow (Slightly larger, semi-transparent)
-                // DrawSphere(gameBall.position, gameBall.radius * 1.1f, Fade(LIME, 0.3f));
-
-                // 3. The Detail Lines
                 DrawSphereWires(gameBall.position, gameBall.radius + 0.1, 10, 10, BLACK);
 
                 // Draw all objects with their specific rotation and scale
@@ -565,6 +613,13 @@ void Game::run() {
 }
 
 Game::~Game() {
+    // Use 'int' here to match the new type of animsCount
+    for (int i = 0; i < animsCount; i++) {
+        UnloadModelAnimation(playerAnims[i]);
+    }
+    RL_FREE(playerAnims); 
+    UnloadModel(playerModel);
+
     UnloadModel(mapModel);
     UnloadTexture(grassTexture);
     UnloadTexture(rockTexture);

@@ -74,6 +74,15 @@ class Game {
         Texture2D grassTexture;
         Texture2D rockTexture;
         
+        Model playerModel;
+        Model vehicleModel;
+        ModelAnimation* playerAnims;
+        int animsCount = 0;          // Changed from unsigned int to int
+        int animFrameCounter = 0;
+        int currentAnimIndex = 0;
+        Vector3 playerPos;
+        Vector3 vehiclePos;
+
         std::vector<GameObject> sceneObjects;
         
         // For Custom Terrain Shading (Slope Blending)
