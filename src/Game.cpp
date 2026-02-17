@@ -150,10 +150,10 @@ void Game::setupResources() {
     SetShaderValue(terrainShader, texRockLoc, &secondSlot, SHADER_UNIFORM_INT);
 
     // Load player
-    playerModel = LoadModel("assets/characters/sci_fi_soldier_light_infantry_low_poly_character.glb");
+    playerModel = LoadModel("assets/characters/Brute/Brute.glb");
     // 2. Load the animations from the SAME FBX
     // Load the animations
-    playerAnims = LoadModelAnimations("assets/characters/sci_fi_soldier_light_infantry_low_poly_character.glb", &animsCount);
+    playerAnims = LoadModelAnimations("assets/characters/Brute/Brute.glb", &animsCount);
 
     // Inside setupResources()
     for (int i = 0; i < playerModel.materialCount; i++) {
@@ -482,18 +482,18 @@ void Game::run() {
         processEvents(deltaTime);
         updateBall(deltaTime);
 
-        // // Only update if playerAnims is NOT null and we have at least one animation
-        // if (playerAnims != nullptr && animsCount > 0) {
-        //     // Safety: Ensure we don't look for an index that doesn't exist
-        //     int validAnimIndex = (currentAnimIndex < animsCount) ? currentAnimIndex : 0;
+        // Only update if playerAnims is NOT null and we have at least one animation
+        if (playerAnims != nullptr && animsCount > 0) {
+            // Safety: Ensure we don't look for an index that doesn't exist
+            int validAnimIndex = (currentAnimIndex < animsCount) ? currentAnimIndex : 0;
             
-        //     ModelAnimation anim = playerAnims[validAnimIndex];
-        //     animFrameCounter++;
+            ModelAnimation anim = playerAnims[validAnimIndex];
+            animFrameCounter++;
 
-        //     UpdateModelAnimation(playerModel, anim, animFrameCounter);
+            UpdateModelAnimation(playerModel, anim, animFrameCounter);
 
-        //     if (animFrameCounter >= anim.frameCount) animFrameCounter = 0;
-        // }
+            if (animFrameCounter >= anim.frameCount) animFrameCounter = 0;
+        }
 
         BeginDrawing();
             ClearBackground(SKYBLUE);
@@ -504,15 +504,15 @@ void Game::run() {
 
                 float playerRotation = (cameraYaw); 
 
-                // 2. Draw the model
-                DrawModelEx(
-                    playerModel, 
-                    playerPos, 
-                    (Vector3){ 0, 1, 0 }, // Rotate around the Y axis
-                    playerRotation,       // This is the "steering" angle
-                    (Vector3){ 0.01f, 0.01f, 0.01f }, 
-                    WHITE
-                );
+                // // 2. Draw the model
+                // DrawModelEx(
+                //     playerModel, 
+                //     playerPos, 
+                //     (Vector3){ 0, 1, 0 }, // Rotate around the Y axis
+                //     playerRotation,       // This is the "steering" angle
+                //     (Vector3){ 0.01f, 0.01f, 0.01f }, 
+                //     WHITE
+                // );
 
                 // DrawModelEx(
                 //     vehicleModel, 
