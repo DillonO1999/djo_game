@@ -1,7 +1,9 @@
 
 add_executable(MyGame
-    Game.cpp
-    main.cpp
+    core/Game.cpp
+    core/main.cpp
+    entities/Player.cpp
+    physics/Physics.cpp
 )
 
 target_include_directories(MyGame PRIVATE src ../include)
